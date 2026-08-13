@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -13,6 +14,14 @@ SCRIPT_DIR = (
     / "run-foreign-news-history"
     / "scripts"
 )
+PLUGIN_DIR = ROOT / "plugins" / "foreign-news-history"
+CONFIG_PATH = (
+    PLUGIN_DIR
+    / "skills"
+    / "run-foreign-news-history"
+    / "assets"
+    / "harness.config.json"
+)
 
 
 def load_module(name: str, filename: str):
@@ -26,6 +35,7 @@ def load_module(name: str, filename: str):
 
 process_job = load_module("process_job", "process_job.py")
 discover_context = load_module("discover_context", "discover_context.py")
+select_schedule = load_module("select_schedule", "select_schedule.py")
 
 
 SCHEDULE = {
@@ -143,6 +153,175 @@ class OriginOrderTests(unittest.TestCase):
         self.assertEqual("일본문화원", result.workgroup)
         self.assertEqual(("글로벌", "작업자갑"), (result.owner, result.worker))
         self.assertTrue(result.extra["profile_complete"])
+
+
+class DynamicScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.payload = {
+            "spreadsheet_id": "sheet-current",
+            "sheet_name": "근무",
+            "range": "A1:J20",
+            "values": [
+                ["동향 스케줄"],
+                ["보고서", "구분", "발행 요일", "월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"],
+                ["현재 보고서", "현재 구분", "현재 시간", "월 담당", "화 담당", "수 담당", "목 담당", "금 담당", "토 담당", "일 담당"],
+            ],
+        }
+
+    def test_selects_worker_from_job_date_weekday(self):
+        selected = select_schedule.select_schedule(
+            self.payload,
+            process_job.dt.date(2026, 7, 23),
+        )
+        assignment = selected["assignments"][0]
+        self.assertEqual(selected["schema_version"], 2)
+        self.assertEqual(selected["weekday"], "목요일")
+        self.assertEqual(selected["heading_cell"], "A1")
+        self.assertEqual(selected["header_cell"], "A2")
+        self.assertEqual(assignment["ref"], "근무!3")
+        self.assertEqual(assignment["report_cell"], "A3")
+        self.assertEqual(assignment["worker_cell"], "G3")
+
+    def test_finds_moved_table_and_preserves_absolute_cells(self):
+        payload = {
+            "spreadsheet_id": "sheet-current",
+            "range": "'근무'!D20:M40",
+            "values": [
+                ["메모"],
+                [],
+                ["", "", "동향 스케줄"],
+                ["", "", "보고서", "구분", "발행 요일", "월요일", "화요일", "수요일", "목요일", "금요일"],
+                ["", "", "현재 보고서", "현재 구분", "현재 시간", "월 담당", "화 담당", "수 담당", "목 담당", "금 담당"],
+            ],
+        }
+        selected = select_schedule.select_schedule(
+            payload,
+            process_job.dt.date(2026, 7, 23),
+        )
+        assignment = selected["assignments"][0]
+        self.assertEqual(selected["source"]["sheet_name"], "근무")
+        self.assertEqual(selected["heading_cell"], "F22")
+        self.assertEqual(selected["header_cell"], "F23")
+        self.assertEqual(selected["weekday_column"], "L")
+        self.assertEqual(assignment["ref"], "근무!24")
+        self.assertEqual(assignment["report_cell"], "F24")
+        self.assertEqual(assignment["division_cell"], "G24")
+        self.assertEqual(assignment["publication_schedule_cell"], "H24")
+        self.assertEqual(assignment["worker_cell"], "L24")
+
+    def test_reads_range_metadata_from_nested_connector_result(self):
+        payload = {
+            "result": {
+                "spreadsheet_id": "sheet-current",
+                "sheet_name": "근무",
+                "range": "C10:L30",
+                "values": [
+                    ["동향 스케줄"],
+                    ["보고서", "구분", "발행 요일", "월요일", "화요일", "수요일", "목요일", "금요일"],
+                    ["현재 보고서", "현재 구분", "현재 시간", "월 담당", "화 담당", "수 담당", "목 담당", "금 담당"],
+                ],
+            }
+        }
+        selected = select_schedule.select_schedule(
+            payload,
+            process_job.dt.date(2026, 7, 23),
+        )
+        self.assertEqual(selected["heading_cell"], "C10")
+        self.assertEqual(selected["assignments"][0]["worker_cell"], "I12")
+
+    def test_requires_schedule_heading(self):
+        payload = dict(self.payload)
+        payload["values"] = payload["values"][1:]
+        with self.assertRaisesRegex(ValueError, "표 제목"):
+            select_schedule.select_schedule(
+                payload,
+                process_job.dt.date(2026, 7, 23),
+            )
+
+    def test_rejects_multiple_schedule_tables(self):
+        payload = dict(self.payload)
+        payload["values"] = self.payload["values"] + [
+            [],
+            ["동향 스케줄"],
+            ["보고서", "구분", "발행 요일", "월요일", "화요일", "수요일", "목요일", "금요일"],
+            ["다른 보고서", "다른 구분", "다른 시간", "월 담당2", "화 담당2", "수 담당2", "목 담당2", "금 담당2"],
+        ]
+        with self.assertRaisesRegex(ValueError, "여러 개"):
+            select_schedule.select_schedule(
+                payload,
+                process_job.dt.date(2026, 7, 23),
+            )
+
+    def test_rejects_duplicate_schedule_titles_on_the_same_row(self):
+        payload = dict(self.payload)
+        payload["values"] = [
+            ["동향 스케줄", "동향 스케줄"],
+            *self.payload["values"][1:],
+        ]
+        with self.assertRaisesRegex(ValueError, "여러 개"):
+            select_schedule.select_schedule(
+                payload,
+                process_job.dt.date(2026, 7, 23),
+            )
+
+    def test_uses_configured_heading_and_validates_current_provenance(self):
+        payload = dict(self.payload)
+        payload["values"] = [["현재 동향 배정표"], *self.payload["values"][1:]]
+        selected = select_schedule.select_schedule(
+            payload,
+            process_job.dt.date(2026, 7, 23),
+            schedule_heading="현재 동향 배정표",
+        )
+        refs = process_job.validate_schedule_evidence(
+            selected,
+            process_job.dt.date(2026, 7, 23),
+            {
+                "spreadsheet": {
+                    "id": "sheet-current",
+                    "schedule_sheet": "근무",
+                    "schedule_heading": "현재 동향 배정표",
+                }
+            },
+        )
+        self.assertEqual(refs, {"근무!3": "목 담당"})
+
+    def test_rejects_legacy_fixed_range_schedule(self):
+        legacy = {
+            "schema_version": 1,
+            "job_date": "2026-07-23",
+            "weekday": "목요일",
+            "source": {
+                "spreadsheet_id": "sheet-current",
+                "sheet_name": "근무",
+                "range": "A1:L100",
+            },
+            "assignments": [
+                {"ref": "근무!3", "worker": "현재 작업자", "worker_cell": "G3"}
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "동적으로 확인"):
+            process_job.validate_schedule_evidence(
+                legacy,
+                process_job.dt.date(2026, 7, 23),
+                {
+                    "spreadsheet": {
+                        "id": "sheet-current",
+                        "schedule_sheet": "근무",
+                        "schedule_heading": "동향 스케줄",
+                    }
+                },
+            )
+
+
+class PublicPackageSafetyTests(unittest.TestCase):
+    def test_public_config_keeps_connection_values_blank(self):
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        spreadsheet = config["spreadsheet"]
+        self.assertEqual(spreadsheet["url"], "")
+        self.assertEqual(spreadsheet["id"], "")
+        self.assertNotIn("schedule_range", spreadsheet)
+        self.assertEqual(spreadsheet["schedule_heading"], "동향 스케줄")
+        self.assertLessEqual(spreadsheet["schedule_scan_max_cells"], 50000)
 
 
 if __name__ == "__main__":

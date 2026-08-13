@@ -5,7 +5,8 @@
     "source_sheet": "작업내역",
     "source_range": "A:K",
     "schedule_sheet": "근무",
-    "schedule_range": "A1:L100",
+    "schedule_heading": "동향 스케줄",
+    "schedule_scan_max_cells": 50000,
     "result_sheet_pattern": "{month}월",
     "result_range": "A:O",
     "timezone": "Asia/Seoul"

@@ -52,7 +52,7 @@ Google Sheets와 엑셀의 열 순서는 정확히 다음 `A:O`를 사용한다.
 - `checkpoint.json`: `local_processed`, `intermediate_saved`, `uploaded_verified` 단계
 - `작업로그.txt`: 실행 요약과 경고
 - `run_context.json`: 현재 입력과 당일 근거만으로 작성한 작업자·역할 판단 기록
-- `동향스케줄.json`: `근무` 탭에서 작업일 요일 열을 선택한 보고서·구분·담당자 및 원본 행·셀 근거
+- `동향스케줄.json`: 매 실행 `근무` 탭의 현재 그리드에서 `동향 스케줄` 제목과 헤더를 동적으로 찾은 뒤 작업일 요일 열을 선택한 보고서·구분·담당자 및 원본 행·셀 근거. 스키마 버전 2이며 실제 조회 범위, `heading_cell`, `header_cell`, 각 행의 `report_cell`, `division_cell`, `publication_schedule_cell`, `worker_cell`을 포함한다.
 
 `intermediate_saved` 전에는 Google Sheets에 쓰지 않는다.
 

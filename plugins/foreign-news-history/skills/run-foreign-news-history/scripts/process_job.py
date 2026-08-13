@@ -640,13 +640,28 @@ def validate_schedule_evidence(
     job_date: dt.date,
     config: dict[str, Any],
 ) -> dict[str, str]:
+    try:
+        schema_version = int(schedule.get("schema_version", 0))
+    except (TypeError, ValueError):
+        schema_version = 0
+    source = schedule.get("source") or {}
+    sheet_config = config.get("spreadsheet", {})
+    expected_heading = clean_text(sheet_config.get("schedule_heading")) or "동향 스케줄"
+    if (
+        schema_version < 2
+        or clean_text(schedule.get("heading")) != expected_heading
+        or not clean_text(schedule.get("heading_cell"))
+        or not clean_text(source.get("range"))
+    ):
+        raise ValueError(
+            "동향 스케줄 근거가 현재 근무 탭의 표 제목과 실제 조회 범위를 동적으로 확인한 형식이 아닙니다. "
+            "근무 탭을 다시 조회해 동향스케줄.json을 생성해야 합니다."
+        )
     if clean_text(schedule.get("job_date")) != job_date.isoformat():
         raise ValueError("동향 스케줄 근거의 작업일이 최종보고서 작업일과 다릅니다.")
     expected_weekday = ("월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일")[job_date.weekday()]
     if clean_text(schedule.get("weekday")) != expected_weekday:
         raise ValueError("동향 스케줄 근거의 요일이 작업일과 다릅니다.")
-    source = schedule.get("source") or {}
-    sheet_config = config.get("spreadsheet", {})
     expected_spreadsheet = clean_text(sheet_config.get("id"))
     expected_sheet = clean_text(sheet_config.get("schedule_sheet"))
     if expected_spreadsheet and clean_text(source.get("spreadsheet_id")) != expected_spreadsheet:
@@ -656,7 +671,10 @@ def validate_schedule_evidence(
     refs = {
         clean_text(item.get("ref")): clean_text(item.get("worker"))
         for item in schedule.get("assignments", [])
-        if isinstance(item, dict) and clean_text(item.get("ref")) and clean_text(item.get("worker"))
+        if isinstance(item, dict)
+        and clean_text(item.get("ref"))
+        and clean_text(item.get("worker"))
+        and clean_text(item.get("worker_cell"))
     }
     if not refs:
         raise ValueError("동향 스케줄 근거에 작업일 담당자 행이 없습니다.")

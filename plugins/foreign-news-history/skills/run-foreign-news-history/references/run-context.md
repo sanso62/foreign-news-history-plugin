@@ -6,7 +6,7 @@
 
 1. 최종보고서에서 작업일을 추출한다.
 2. 작업일 전날의 정기 작업내역을 Google Sheets에서 가져온다.
-3. `외신 일일동향`의 `근무` 탭을 읽고 작업일의 요일 열을 선택한 `동향스케줄.json`을 만든다.
+3. `외신 일일동향`의 `근무` 탭 메타데이터와 현재 그리드를 매번 다시 읽고 `동향 스케줄` 제목 및 헤더 위치를 동적으로 확인한 뒤, 작업일의 요일 열을 선택한 스키마 버전 2 `동향스케줄.json`을 만든다. 과거 조회 범위나 셀 주소는 재사용하지 않는다.
 4. 사용자가 명시한 일본언론동향 원본 경로를 입력에 포함한다. 주변 폴더에서 경로를 추측하지 않는다.
 5. `scripts/discover_context.py`로 현재 파일명, 경로, 문서 미리보기, 기사 수, 스케줄, 일본언론동향, SHA-256과 입력 지문을 수집한다.
 6. 스크립트가 프롬프트의 파일 단계별 역할표를 적용하고, Codex가 현재 파일과 작업일 동향스케줄을 함께 읽어 충돌과 예외를 검수한다.
@@ -24,11 +24,15 @@
     "evidence": ["최종보고서 본문 또는 파일명 근거"]
   },
   "schedule": {
+    "schema_version": 2,
     "job_date": "YYYY-MM-DD",
     "weekday": "작업일 요일",
-    "source": {"spreadsheet_id": "", "sheet_name": "근무", "range": "A1:L100"},
+    "heading": "동향 스케줄",
+    "heading_cell": "현재 표 제목 셀",
+    "header_cell": "현재 보고서 헤더 셀",
+    "source": {"spreadsheet_id": "", "sheet_name": "근무", "range": "현재 실행에서 조회한 실제 A1 범위"},
     "assignments": [
-      {"ref": "근무!4", "sheet_row": 4, "report": "시트 원문", "division": "시트 원문", "worker": "시트 원문", "worker_cell": "G4"}
+      {"ref": "근무!4", "sheet_row": 4, "report": "시트 원문", "report_cell": "A4", "division": "시트 원문", "division_cell": "B4", "worker": "시트 원문", "worker_cell": "G4"}
     ],
     "sha256": "동향스케줄.json 해시"
   },
