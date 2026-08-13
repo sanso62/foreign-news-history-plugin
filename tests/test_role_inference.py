@@ -2,6 +2,7 @@ import importlib.util
 import json
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -298,6 +299,117 @@ class OriginOrderTests(unittest.TestCase):
             self.MATCHING,
         )
         self.assertIs(draft, chosen)
+        self.assertEqual([], reasons)
+
+    def test_unique_rewritten_regular_precedes_exact_late_aggregate(self):
+        article = process_job.Article(
+            "final.hwp", 1, "economy", "Example News", "4.2",
+            "Government abandons growth-first strategy - what will markets do next?",
+        )
+        regular = process_job.Candidate(
+            "regular",
+            "Government shifts from growth priority to stability approach - market choices ahead",
+            "Example News", "4.2", workgroup="regular", owner="coordinator", worker="worker",
+            extra={"comparison_stage": "reference", "profile_complete": True},
+        )
+        aggregate = process_job.Candidate(
+            "worker", article.body_title, "Example News", "4.2",
+            workgroup="morning", owner="coordinator", worker="worker",
+            extra={
+                "source_kind": "late_morning_aggregate", "comparison_stage": "morning",
+                "profile_complete": True, "priority": 10,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [], "worker": [aggregate]}, self.MATCHING
+        )
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_unique_rewritten_japan_overrides_regular_but_exact_duplicate_does_not(self):
+        article = process_job.Article(
+            "final.hwp", 1, "diplomacy", "Example News", "4.2",
+            "Government abandons growth-first strategy - what will markets do next?",
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "Example News", "4.2",
+            workgroup="regular", owner="coordinator", worker="worker",
+            extra={"comparison_stage": "reference", "profile_complete": True},
+        )
+        japan = process_job.Candidate(
+            "japan",
+            "Government shifts from growth priority to stability approach - market choices ahead",
+            "Example News", "4.3", workgroup="japan", owner="coordinator", worker="worker",
+            extra={"comparison_stage": "reference", "profile_complete": True},
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [japan], "worker": []}, self.MATCHING
+        )
+        self.assertIs(japan, chosen)
+        self.assertEqual([], reasons)
+
+        exact_japan = replace(japan, title=article.body_title, date="4.2")
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [exact_japan], "worker": []}, self.MATCHING
+        )
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_unique_rewritten_regular_accepts_unambiguous_source_language_media(self):
+        article = process_job.Article(
+            "final.hwp", 1, "diplomacy", "Translated outlet", "4.2",
+            "Secretary meets four regional partners and stresses continued engagement",
+        )
+        regular = process_job.Candidate(
+            "regular",
+            "Secretary stresses engagement in meetings with four regional partners",
+            "Original-language outlet name", "4.2",
+            workgroup="regular", owner="coordinator", worker="worker",
+            extra={"profile_complete": True, "comparison_stage": "reference"},
+        )
+        unrelated = process_job.Candidate(
+            "regular", "Markets close higher after semiconductor rally",
+            "Another outlet", "4.2",
+            extra={"profile_complete": True, "comparison_stage": "reference"},
+        )
+        aggregate = process_job.Candidate(
+            "worker", article.body_title, article.media, article.date,
+            workgroup="morning", owner="coordinator", worker="worker",
+            extra={
+                "profile_complete": True, "comparison_stage": "morning",
+                "source_kind": "morning_aggregate",
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular, unrelated], "japan": [], "worker": [aggregate]},
+            self.MATCHING,
+        )
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_source_language_inference_does_not_replace_exact_morning_auxiliary(self):
+        article = process_job.Article(
+            "final.hwp", 1, "diplomacy", "Translated outlet", "4.2",
+            "Country denies request to deploy ships through the strait",
+        )
+        regular = process_job.Candidate(
+            "regular", "No request was made for national ships in the strait",
+            "Different outlet", "4.2",
+            extra={"profile_complete": True, "comparison_stage": "reference"},
+        )
+        auxiliary = process_job.Candidate(
+            "worker", article.body_title, article.media, article.date,
+            workgroup="morning", owner="assistant", worker="worker",
+            extra={
+                "profile_complete": True, "comparison_stage": "morning",
+                "source_kind": "morning_auxiliary",
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [], "worker": [auxiliary]}, self.MATCHING
+        )
+        self.assertIs(auxiliary, chosen)
         self.assertEqual([], reasons)
 
     def test_clear_review_threshold_draft_has_no_low_score_review(self):

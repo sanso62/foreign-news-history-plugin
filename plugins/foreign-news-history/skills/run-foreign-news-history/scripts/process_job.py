@@ -64,6 +64,12 @@ SOURCE_HEADERS = [
 FIXED_COMPARISON_ORDER = ("reference", "afternoon", "morning")
 REFERENCE_SOURCE_ORDER = ("regular", "japan")
 INITIAL_DRAFT_SOURCE_KINDS = {"domestic_draft", "global_draft"}
+COPIED_WORKFILE_SOURCE_KINDS = {
+    "afternoon_aggregate",
+    "morning_auxiliary",
+    "morning_aggregate",
+    "late_morning_aggregate",
+}
 
 # These are workflow-stage labels, not person mappings.  They are intentionally
 # fixed because they define the meaning of the result columns.
@@ -1474,65 +1480,123 @@ def plausible_reference_conflicts(
                 same_media_date.append((score, title_score, candidate))
     conflicts: list[tuple[float, Candidate]] = []
     for score, title_score, candidate in same_media_date:
-        if len(same_media_date) == 1 or title_score >= 0.2:
+        if title_score >= 0.2:
             conflicts.append((score, candidate))
     return sorted(conflicts, key=lambda pair: pair[0], reverse=True)
 
 
-def unique_rewritten_regular_before_morning_auxiliary(
+def unique_rewritten_regular_before_copied_workfile(
     article: Article,
     regular_candidates: list[Candidate],
     worker_candidates: list[Candidate],
     matching: dict[str, float],
 ) -> tuple[float, Candidate] | None:
-    """Recover a uniquely identifiable regular item before a morning auxiliary.
+    """Recover a uniquely identifiable regular item before a copied workfile.
 
-    Morning auxiliary files are a late scratch/import stage, so an exact title in
-    one of them is not proof that the article first entered there.  A heavily
-    rewritten regular-history title can still establish the earlier inflow when
-    it is the only regular item from the same media and date and retains a
-    meaningful title relationship.  Individual afternoon drafts remain direct
+    Aggregate and morning auxiliary files are later copy/import stages, so an
+    exact title in one of them is not proof that the article first entered there.
+    A heavily rewritten regular-history title can still establish the earlier
+    inflow when it is the only regular item from the same media and date and
+    retains a meaningful title relationship.  Individual drafts remain direct
     provenance and deliberately disable this inference.
     """
-    automatic_afternoon = ranked_origin_matches(
+    automatic_initial_draft = ranked_origin_matches(
         article,
         [
             candidate
             for candidate in worker_candidates
-            if clean_text(candidate.extra.get("comparison_stage")) == "afternoon"
+            if clean_text(candidate.extra.get("source_kind")) in INITIAL_DRAFT_SOURCE_KINDS
         ],
         matching["auto_threshold"],
     )
-    if automatic_afternoon:
+    if automatic_initial_draft:
         return None
 
-    automatic_morning_auxiliary = ranked_origin_matches(
+    automatic_copied_workfile = ranked_origin_matches(
         article,
         [
             candidate
             for candidate in worker_candidates
-            if clean_text(candidate.extra.get("source_kind")) == "morning_auxiliary"
+            if clean_text(candidate.extra.get("source_kind")) in COPIED_WORKFILE_SOURCE_KINDS
         ],
         matching["auto_threshold"],
     )
-    if not automatic_morning_auxiliary:
+    if not automatic_copied_workfile:
         return None
 
-    same_media_date = [
+    same_date = [
         candidate
         for candidate in regular_candidates
         if article.date
         and candidate.date
         and normalize_key(article.date) == normalize_key(candidate.date)
-        and media_similarity(article.media, candidate.media) >= 0.85
     ]
-    if len(same_media_date) != 1:
-        return None
-
-    candidate = same_media_date[0]
-    score = candidate_score(article, candidate)
+    same_media_date = [
+        candidate
+        for candidate in same_date
+        if media_similarity(article.media, candidate.media) >= 0.85
+    ]
     rewrite_threshold = matching["review_threshold"] * (2.0 / 3.0)
+
+    # The final report can use a translated or abbreviated outlet spelling while
+    # regular history preserves the source-language name.  Do not maintain an
+    # outlet alias table: accept the top same-date title only when it is both
+    # meaningful and clearly separated from every competing regular item.  An
+    # exact morning auxiliary remains direct article-level provenance when no
+    # same-media regular candidate corroborates the translated outlet identity.
+    if same_media_date:
+        ranked_regular = ranked_matches(article, same_media_date)
+    else:
+        if any(
+            clean_text(candidate.extra.get("source_kind")) == "morning_auxiliary"
+            for _, candidate in automatic_copied_workfile
+        ):
+            return None
+        ranked_regular = ranked_matches(article, same_date)
+    if not ranked_regular:
+        return None
+    score, candidate = ranked_regular[0]
     if score < rewrite_threshold:
+        return None
+    if (
+        len(ranked_regular) > 1
+        and score - ranked_regular[1][0] < matching["ambiguity_margin"]
+    ):
+        return None
+    return score, candidate
+
+
+def unique_rewritten_japan_reference(
+    article: Article,
+    japan_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> tuple[float, Candidate] | None:
+    """Select one strongly evidenced Japan rewrite without a manual confirmation.
+
+    Exact Japan/regular duplicates keep the normal regular-first rule.  This
+    narrow case covers a substantially rewritten Japan title: there must be one
+    and only one same-media candidate within one day, and its score must remain
+    meaningful while still below the ordinary review threshold.
+    """
+    same_media_near_date: list[Candidate] = []
+    article_date = parse_date(article.date)
+    for candidate in japan_candidates:
+        if media_similarity(article.media, candidate.media) < 0.85:
+            continue
+        candidate_date = parse_date(candidate.date)
+        if (
+            article_date
+            and candidate_date
+            and abs((article_date - candidate_date).days) > 1
+        ):
+            continue
+        same_media_near_date.append(candidate)
+    if len(same_media_near_date) != 1:
+        return None
+    candidate = same_media_near_date[0]
+    score = candidate_score(article, candidate)
+    rewrite_threshold = matching["review_threshold"] * 0.6
+    if score < rewrite_threshold or score >= matching["review_threshold"]:
         return None
     return score, candidate
 
@@ -1583,13 +1647,18 @@ def choose_origin(
         initial_drafts,
         matching["review_threshold"],
     )
-    rewritten_regular = unique_rewritten_regular_before_morning_auxiliary(
+    rewritten_regular = unique_rewritten_regular_before_copied_workfile(
         article,
         pools.get("regular", []),
         workers,
         matching,
     )
-    rewritten_regular_selected = False
+    rewritten_japan = unique_rewritten_japan_reference(
+        article,
+        pools.get("japan", []),
+        matching,
+    )
+    rewritten_reference_selected = False
 
     # An individual draft is direct article-level provenance.  A strong reference
     # match stays authoritative even when the same text was copied into a later
@@ -1629,6 +1698,12 @@ def choose_origin(
             chosen_score, chosen = initial_score, initial_candidate
             chosen_stage = clean_text(initial_candidate.extra.get("comparison_stage")) or "afternoon"
 
+    if rewritten_japan is not None:
+        chosen_score, chosen = rewritten_japan
+        chosen_ranked = [rewritten_japan]
+        chosen_stage = "reference"
+        rewritten_reference_selected = True
+
     # Stage 1: Google Sheets regular history and the supplied Japan report.
     # If an article is in both, the long-standing business rule selects regular
     # as the origin while Japan membership is still recorded separately as O.
@@ -1645,7 +1720,7 @@ def choose_origin(
         chosen_score, chosen = rewritten_regular
         chosen_ranked = [rewritten_regular]
         chosen_stage = "reference"
-        rewritten_regular_selected = True
+        rewritten_reference_selected = True
 
     # Stage 2 and 3 are determined from the explicit input folder, not the
     # filename, source_kind, run_context priority, or a person's identity.
@@ -1673,7 +1748,7 @@ def choose_origin(
     if (
         chosen_score < matching["auto_threshold"]
         and not clear_initial_draft
-        and not rewritten_regular_selected
+        and not rewritten_reference_selected
     ):
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
@@ -1947,10 +2022,11 @@ def japan_membership(
             review_candidates.append((candidate_score(article, candidate), candidate))
     if len(review_candidates) == 1:
         score, candidate = review_candidates[0]
-        reasons.append(
-            "일본동향 동일 매체·인접 날짜 저점수 후보 직접 대조 필요: "
-            f"{candidate.title} (점수 {score:.3f})"
-        )
+        if score >= threshold * 0.3:
+            reasons.append(
+                "일본동향 동일 매체·인접 날짜 저점수 후보 직접 대조 필요: "
+                f"{candidate.title} (점수 {score:.3f})"
+            )
     return False, automatic_score, [*exclusion_reasons, *reasons]
 
 
@@ -2712,6 +2788,18 @@ def main() -> int:
             japan_confirmation,
         )
         reasons.extend(japan_reasons)
+        if (
+            origin is not None
+            and origin.source_type == "japan"
+            and not (japan_confirmation and japan_confirmation.get("included") is False)
+        ):
+            japan_match = True
+            japan_score = score
+            reasons = [
+                reason
+                for reason in reasons
+                if not reason.startswith("일본동향 동일 매체·인접 날짜 저점수 후보 직접 대조 필요")
+            ]
         prior_origin = origin
         preferred_origin, preferred_score, preferred_reasons = confirmed_japan_origin(
             origin,
