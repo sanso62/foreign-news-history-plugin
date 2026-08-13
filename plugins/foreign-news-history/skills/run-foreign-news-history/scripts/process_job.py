@@ -71,8 +71,10 @@ WORKFILE_ROLE_LABELS = {
     "domestic_draft": ("1조", "국내"),
     "global_draft": ("1조", "글로벌"),
     "afternoon_aggregate": ("오후", "오후/총괄"),
+    "afternoon_aggregate_omitted": ("1조", "오후/총괄"),
     "morning_auxiliary": ("2조", "보조"),
     "morning_aggregate": ("2조", "오전/총괄"),
+    "late_morning_aggregate": ("1조", "오후/총괄"),
 }
 REFERENCE_ROLE_LABELS = {
     "regular": ("정기", "오후/총괄"),
@@ -328,6 +330,7 @@ def display_media(value: str) -> str:
 def display_title(value: str) -> str:
     """Apply only presentation cleanup confirmed by the authoritative result format."""
     title = clean_text(value)
+    title = title.replace("‧", "·")
     title = re.sub(r"^\[영상\]\s*", "", title)
     title = re.sub(r"…\s+", "…", title)
 
@@ -569,10 +572,13 @@ def apply_front_titles(articles: list[Article], entries: list[dict[str, str]]) -
                 article.category = entry["category"]
             if position == 0:
                 # A slash group is one edited first-page entry.  Its first media
-                # is the representative and therefore inherits the group title;
-                # the following body headings retain their own similar titles.
-                article.canonical_title = entry["title"]
-                article.front_title_applied = True
+                # is the representative.  Only inherit the group title when it
+                # still describes that representative; media order alone is not
+                # enough because editors occasionally reuse a slash bullet for
+                # adjacent, unrelated body articles.
+                if text_similarity(article.body_title, entry["title"]) >= 0.4:
+                    article.canonical_title = entry["title"]
+                    article.front_title_applied = True
                 article.group_representative = True
             if position:
                 article.similar = True
@@ -599,7 +605,17 @@ def apply_front_titles(articles: list[Article], entries: list[dict[str, str]]) -
         score, title_score, best_index = max(choices)
         threshold = 0.58 if not article.similar else 0.88
         if score >= threshold and (not article.similar or title_score >= 0.82):
-            article.canonical_title = entries[best_index]["title"]
+            entry_title = entries[best_index]["title"]
+            # Preserve a meaningful middle-dot compound from the body when the
+            # front title merely collapsed it (for example, 미·일 -> 미일).
+            # Other punctuation edits on the front page remain authoritative.
+            collapsed_middle_dot = bool(
+                any(mark in article.body_title for mark in ("·", "‧"))
+                and not any(mark in entry_title for mark in ("·", "‧"))
+                and normalize_key(article.body_title) == normalize_key(entry_title)
+            )
+            if not collapsed_middle_dot:
+                article.canonical_title = entry_title
             article.front_title_applied = True
             if entries[best_index]["category"]:
                 article.category = entries[best_index]["category"]
@@ -984,6 +1000,8 @@ def worker_candidates(
                         "include_unmatched": bool((profile or {}).get("include_unmatched", False)),
                         "front_title_applied": article.front_title_applied,
                         "group_representative": article.group_representative,
+                        "starred": article.starred,
+                        "similar": article.similar,
                         "body_title": article.body_title,
                         "profile_complete": profile_complete,
                         "profile_evidence": (profile or {}).get("evidence", []),
@@ -1040,9 +1058,47 @@ def apply_latest_group_titles(
         if not matches:
             continue
         _, selected = max(matches, key=lambda item: item[0])
+        if normalize_key(selected.title) == normalize_key(article.body_title):
+            continue
         article.canonical_title = selected.title
         article.front_title_applied = True
         article.group_representative = True
+
+
+def apply_latest_aggregate_categories(
+    articles: list[Article],
+    candidates: list[Candidate],
+    review_threshold: float,
+    auto_threshold: float,
+) -> None:
+    """Use a compatible category from the latest morning aggregate."""
+    aggregate_candidates = [
+        candidate
+        for candidate in candidates
+        if clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+        and clean_text(candidate.extra.get("category"))
+    ]
+    for article in articles:
+        matches = [
+            (candidate_score(article, candidate), candidate)
+            for candidate in aggregate_candidates
+            if candidate_score(article, candidate) >= max(review_threshold, auto_threshold)
+        ]
+        if not matches:
+            continue
+        _, selected = max(
+            matches,
+            key=lambda item: (
+                workfile_revision_rank(item[1].source_file),
+                item[0],
+                int(item[1].extra.get("article_order", 0)),
+            ),
+        )
+        latest_category = clean_text(selected.extra.get("category"))
+        current_key = normalize_key(article.category)
+        latest_key = normalize_key(latest_category)
+        if current_key and latest_key and (current_key in latest_key or latest_key in current_key):
+            article.category = latest_category
 
 
 def align_group_child_titles(articles: list[Article]) -> None:
@@ -1122,18 +1178,19 @@ def infer_representative_draft_lineage(
         sequence = aggregate_files[aggregate.source_file]
         position = sequence.index(aggregate)
 
-        def nearby(step: int) -> Candidate | None:
-            for distance in range(1, 4):
-                probe_position = position + (step * distance)
-                if probe_position < 0 or probe_position >= len(sequence):
-                    break
-                lineage = direct_draft(sequence[probe_position])
-                if lineage is not None:
-                    return lineage
-            return None
-
-        before = nearby(-1)
-        after = nearby(1)
+        cluster_end = index + 1
+        while cluster_end < len(final_articles) and final_articles[cluster_end].similar:
+            cluster_end += 1
+        similar_count = cluster_end - index - 1
+        before_position = position - 1
+        after_position = position + similar_count + 1
+        if before_position < 0 or after_position >= len(sequence):
+            continue
+        # The boundary articles must themselves be direct draft matches.  Looking
+        # several rows away can incorrectly pull an unrelated representative into
+        # a draft merely because the same editor handled surrounding sections.
+        before = direct_draft(sequence[before_position])
+        after = direct_draft(sequence[after_position])
         if before is None or after is None:
             continue
         before_key = (
@@ -1466,14 +1523,14 @@ def choose_origin(
     ranked_initial_drafts = ranked_origin_matches(
         article,
         initial_drafts,
-        matching["auto_threshold"],
+        matching["review_threshold"],
     )
 
-    # An individual draft is direct article-level provenance.  Prefer it over a
-    # looser regular/Japan title match only when the current draft is both an
-    # automatic match and materially stronger.  Equal or near-equal matches keep
-    # the earlier reference-source order (important when a regular item was also
-    # copied into a later draft).
+    # An individual draft is direct article-level provenance.  A strong reference
+    # match stays authoritative even when the same text was copied into a later
+    # draft.  Below the automatic threshold, a draft can take precedence only
+    # when it is automatic and materially stronger.  If no reference reaches the
+    # review threshold, a clear review-threshold draft is sufficient provenance.
     reference_choice: tuple[float, Candidate] | None = None
     for source_type in REFERENCE_SOURCE_ORDER:
         ranked = ranked_by_source.get(source_type, [])
@@ -1482,8 +1539,27 @@ def choose_origin(
             break
     if ranked_initial_drafts:
         initial_score, initial_candidate = ranked_initial_drafts[0]
-        reference_score = reference_choice[0] if reference_choice else 0.0
-        if reference_choice and initial_score - reference_score >= matching["ambiguity_margin"]:
+        reference_score = (
+            reference_choice[0]
+            if reference_choice
+            else max(
+                (best_scores.get(source_type, 0.0) for source_type in REFERENCE_SOURCE_ORDER),
+                default=0.0,
+            )
+        )
+        draft_preferred = bool(
+            (
+                reference_choice is None
+                and initial_score - reference_score >= matching["ambiguity_margin"]
+            )
+            or (
+                reference_choice is not None
+                and reference_score < matching["auto_threshold"]
+                and initial_score >= matching["auto_threshold"]
+                and initial_score - reference_score >= matching["ambiguity_margin"]
+            )
+        )
+        if draft_preferred:
             chosen_ranked = ranked_initial_drafts
             chosen_score, chosen = initial_score, initial_candidate
             chosen_stage = clean_text(initial_candidate.extra.get("comparison_stage")) or "afternoon"
@@ -1808,12 +1884,56 @@ def omitted_worker_candidates(
     candidates: list[Candidate],
     matching: dict[str, float],
 ) -> list[Candidate]:
-    eligible = [candidate for candidate in candidates if candidate.extra.get("include_unmatched", False)]
+    morning_aggregates = [
+        candidate
+        for candidate in candidates
+        if clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+    ]
+
+    def carried_into_morning(candidate: Candidate) -> bool:
+        if clean_text(candidate.extra.get("source_kind")) != "afternoon_aggregate":
+            return False
+        return bool(
+            ranked_origin_matches(
+                candidate_as_article(candidate),
+                morning_aggregates,
+                matching["review_threshold"],
+            )
+        )
+
+    eligible = [
+        candidate
+        for candidate in candidates
+        if candidate.extra.get("include_unmatched", False)
+        or carried_into_morning(candidate)
+    ]
+
+    def unique_final_rewrite(candidate: Candidate) -> bool:
+        same_media_date = [
+            article
+            for article in final_articles
+            if media_similarity(article.media, candidate.media) >= 0.85
+            and (
+                not article.date
+                or not candidate.date
+                or parse_date(article.date) == parse_date(candidate.date)
+            )
+        ]
+        if len(same_media_date) != 1:
+            return False
+        return candidate_score(same_media_date[0], candidate) >= 0.2
+
     unmatched = [
         candidate
         for candidate in eligible
-        if not final_articles
-        or max(candidate_score(article, candidate) for article in final_articles) < matching["review_threshold"]
+        if (
+            not final_articles
+            or (
+                max(candidate_score(article, candidate) for article in final_articles)
+                < matching["review_threshold"]
+                and not unique_final_rewrite(candidate)
+            )
+        )
     ]
     unmatched.sort(key=lambda item: int(item.extra.get("priority", 0)), reverse=True)
     unique: list[Candidate] = []
@@ -1828,6 +1948,16 @@ def omitted_worker_candidates(
             for existing in unique
         )
         if not duplicate:
+            if clean_text(candidate.extra.get("source_kind")) == "afternoon_aggregate":
+                candidate = replace(
+                    candidate,
+                    workgroup="1조",
+                    owner="오후/총괄",
+                    extra={
+                        **candidate.extra,
+                        "source_kind": "afternoon_aggregate_omitted",
+                    },
+                )
             unique.append(candidate)
     return unique
 
@@ -1836,6 +1966,8 @@ def closest_current_category(
     value: str,
     final_articles: list[Article],
     threshold: float,
+    candidate: Candidate | None = None,
+    ambiguity_margin: float = 0.035,
 ) -> tuple[str, bool]:
     raw = clean_text(value)
     categories = list(dict.fromkeys(article.category for article in final_articles if article.category))
@@ -1844,10 +1976,217 @@ def closest_current_category(
     exact = next((category for category in categories if normalize_key(category) == normalize_key(raw)), None)
     if exact:
         return exact, True
-    ranked = sorted(((text_similarity(raw, category), category) for category in categories), reverse=True)
-    if ranked and ranked[0][0] >= threshold:
-        return ranked[0][1], True
+    contextual_scores: dict[str, float] = {}
+    if candidate is not None:
+        contextual_scores = {
+            category: max(
+                (
+                    candidate_score(article, candidate)
+                    for article in final_articles
+                    if article.category == category
+                ),
+                default=0.0,
+            )
+            for category in categories
+        }
+    ranked = sorted(
+        (
+            (
+                0.55 * text_similarity(raw, category)
+                + 0.45 * contextual_scores.get(category, 0.0),
+                text_similarity(raw, category),
+                contextual_scores.get(category, 0.0),
+                category,
+            )
+            for category in categories
+        ),
+        reverse=True,
+    )
+    if ranked:
+        combined, lexical, contextual, category = ranked[0]
+        runner_up = ranked[1][0] if len(ranked) > 1 else 0.0
+        if lexical >= threshold or (
+            candidate is not None
+            and contextual >= 0.25
+            and combined - runner_up >= ambiguity_margin
+        ):
+            return category, True
     return raw, False
+
+
+def automatic_similar_additions(
+    final_articles: list[Article],
+    worker_candidates: list[Candidate],
+    pools: dict[str, list[Candidate]],
+    matching: dict[str, float],
+) -> list[dict[str, Any]]:
+    """Recover explicit similar rows present in the latest morning aggregate."""
+    aggregates = [
+        candidate
+        for candidate in worker_candidates
+        if clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+    ]
+    if not aggregates:
+        return []
+    latest_revision = max(workfile_revision_rank(candidate.source_file) for candidate in aggregates)
+    latest = [
+        candidate
+        for candidate in aggregates
+        if workfile_revision_rank(candidate.source_file) == latest_revision
+    ]
+    by_file: dict[str, list[Candidate]] = {}
+    for candidate in latest:
+        by_file.setdefault(candidate.source_file, []).append(candidate)
+    for sequence in by_file.values():
+        sequence.sort(key=lambda item: int(item.extra.get("article_order", 0)))
+
+    additions: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in latest:
+        if not candidate.extra.get("similar", False):
+            continue
+        key = (normalize_key(candidate.media), normalize_key(candidate.date), normalize_key(candidate.title))
+        if key in seen:
+            continue
+        seen.add(key)
+        if any(candidate_score(article, candidate) >= 0.9 for article in final_articles):
+            continue
+        sequence = by_file[candidate.source_file]
+        position = sequence.index(candidate)
+        anchor_candidate = next(
+            (
+                sequence[index]
+                for index in range(position - 1, -1, -1)
+                if not sequence[index].extra.get("similar", False)
+            ),
+            None,
+        )
+        if anchor_candidate is None:
+            continue
+        anchor_matches = sorted(
+            (
+                (candidate_score(article, anchor_candidate), article)
+                for article in final_articles
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if not anchor_matches or anchor_matches[0][0] < matching["review_threshold"]:
+            continue
+        _, anchor_article = anchor_matches[0]
+        article = candidate_as_article(candidate)
+        article.category = clean_text(candidate.extra.get("category")) or anchor_article.category
+        article.similar = True
+        article.starred = bool(candidate.extra.get("starred", False))
+        origin, score, reasons, best_scores = choose_origin(article, pools, matching)
+        if origin is None:
+            origin = candidate
+        additions.append(
+            {
+                "kind": "similar",
+                "after_order": anchor_article.order,
+                "article": article,
+                "candidate": origin,
+                "source_candidate": candidate,
+                "score": score,
+                "best_scores": best_scores,
+                "origin_reasons": reasons,
+                "evidence": [
+                    "최신 오전 취합본에서 대표 기사 다음의 명시적 유사보도 행으로 확인"
+                ],
+                "automatic": True,
+            }
+        )
+    return additions
+
+
+def late_morning_aggregate_origin(
+    article: Article,
+    origin: Candidate | None,
+    pools: dict[str, list[Candidate]],
+    matching: dict[str, float],
+    target_date: dt.date,
+) -> Candidate | None:
+    """Classify a target-date article first introduced in the latest morning aggregate."""
+    if origin is None or clean_text(origin.extra.get("source_kind")) != "morning_aggregate":
+        return origin
+    article_date = parse_date(article.date)
+    if not article_date or (article_date.month, article_date.day) != (target_date.month, target_date.day):
+        return origin
+    morning_aggregates = [
+        candidate
+        for candidate in pools.get("worker", [])
+        if clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+    ]
+    if not morning_aggregates:
+        return origin
+    latest_revision = max(workfile_revision_rank(candidate.source_file) for candidate in morning_aggregates)
+    if workfile_revision_rank(origin.source_file) != latest_revision:
+        return origin
+    earlier_sources = [
+        candidate
+        for source_type, candidates in pools.items()
+        for candidate in candidates
+        if not (
+            source_type == "worker"
+            and candidate.source_file == origin.source_file
+            and clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+        )
+    ]
+    if ranked_origin_matches(article, earlier_sources, matching["review_threshold"]):
+        return origin
+    return replace(
+        origin,
+        workgroup="1조",
+        owner="오후/총괄",
+        extra={**origin.extra, "source_kind": "late_morning_aggregate"},
+    )
+
+
+def reorder_front_only_results(
+    articles: list[Article],
+    rows: list[list[Any]],
+    details: list[dict[str, Any]],
+) -> tuple[list[list[Any]], list[dict[str, Any]]]:
+    """Keep a same-file front-only packet together across a later insertion."""
+    records = list(zip(articles, rows, details))
+    stage_rank = {stage: index for index, stage in enumerate(FIXED_COMPARISON_ORDER)}
+    index = 0
+    while index + 2 < len(records):
+        first, middle, third = records[index : index + 3]
+        same_front_section = bool(
+            not first[0].body_present
+            and not middle[0].body_present
+            and not third[0].body_present
+            and first[0].category == middle[0].category == third[0].category
+        )
+        first_key = (
+            clean_text(first[2].get("origin_source_kind")),
+            clean_text(first[2].get("origin_file")),
+        )
+        third_key = (
+            clean_text(third[2].get("origin_source_kind")),
+            clean_text(third[2].get("origin_file")),
+        )
+        first_stage = clean_text(first[2].get("origin_comparison_stage"))
+        middle_stage = clean_text(middle[2].get("origin_comparison_stage"))
+        if (
+            same_front_section
+            and first_key == third_key
+            and all(first_key)
+            and first_key
+            != (
+                clean_text(middle[2].get("origin_source_kind")),
+                clean_text(middle[2].get("origin_file")),
+            )
+            and stage_rank.get(first_stage, len(stage_rank))
+            < stage_rank.get(middle_stage, len(stage_rank))
+        ):
+            records[index + 1], records[index + 2] = third, middle
+            index += 3
+            continue
+        index += 1
+    return [record[1] for record in records], [record[2] for record in records]
 
 
 def result_row(
@@ -2169,6 +2508,12 @@ def main() -> int:
         config["matching"]["review_threshold"],
     )
     align_group_child_titles(final_articles)
+    apply_latest_aggregate_categories(
+        final_articles,
+        workers,
+        config["matching"]["review_threshold"],
+        config["matching"]["auto_threshold"],
+    )
     japan, japan_warnings = japan_candidates(
         japan_path,
         source_profiles.get("japan"),
@@ -2206,6 +2551,12 @@ def main() -> int:
     )
     confirmed_additions, addition_warnings = confirmed_article_additions(run_context, pools)
     warnings.extend(addition_warnings)
+    automatic_additions = automatic_similar_additions(
+        final_articles,
+        workers,
+        pools,
+        config["matching"],
+    )
     rows: list[list[Any]] = []
     reviews: list[dict[str, Any]] = []
     match_details: list[dict[str, Any]] = []
@@ -2301,6 +2652,13 @@ def main() -> int:
                 reasons = [reason for reason in reasons if reason != "유입 경로를 확인하지 못함"]
             if not origin.extra.get("profile_complete", False):
                 reasons.append("유입 파일의 작업자·역할 근거 불완전")
+        origin = late_morning_aggregate_origin(
+            article,
+            origin,
+            pools,
+            config["matching"],
+            target_date,
+        )
         japan_value = "O" if japan_match else ""
         if not article.category:
             reasons.append("최종보고서 상위 카테고리 미확인")
@@ -2344,10 +2702,12 @@ def main() -> int:
         if reasons:
             reviews.append({"row_number": article.order + 1, "row": row, **detail})
 
+    rows, match_details = reorder_front_only_results(final_articles, rows, match_details)
+
     def addition_output(record: dict[str, Any]) -> tuple[list[Any], dict[str, Any], list[str]]:
         article = record["article"]
         candidate = record["candidate"]
-        reasons: list[str] = []
+        reasons: list[str] = list(record.get("origin_reasons", []))
         if not candidate.extra.get("profile_complete", False):
             reasons.append("유입 파일의 작업자·역할 근거 불완전")
         if not final_profile_complete:
@@ -2382,11 +2742,12 @@ def main() -> int:
             "origin_source_kind": candidate.extra.get("source_kind"),
             "origin_actual_edit_source_kind": candidate.extra.get("actual_edit_source_kind"),
             "origin_comparison_stage": candidate.extra.get("comparison_stage"),
-            "score": 1.0,
-            "best_scores": {},
+            "score": round(float(record.get("score", 1.0)), 4),
+            "best_scores": record.get("best_scores", {}),
             "reasons": reasons,
-            "confirmed_addition": record["kind"],
-            "reference_file": record["reference_file"],
+            "confirmed_addition": record["kind"] if not record.get("automatic") else None,
+            "automatic_addition": record["kind"] if record.get("automatic") else None,
+            "reference_file": record.get("reference_file"),
             "confirmation_evidence": record["evidence"],
             "role_confirmed_from_reference": False,
             "japan_match_score": round(japan_score, 4),
@@ -2394,7 +2755,11 @@ def main() -> int:
         return row, detail, reasons
 
     inline_additions = sorted(
-        (record for record in confirmed_additions if record["kind"] == "similar"),
+        (
+            record
+            for record in [*confirmed_additions, *automatic_additions]
+            if record["kind"] == "similar"
+        ),
         key=lambda record: int(record["after_order"]),
     )
     for record in inline_additions:
@@ -2438,8 +2803,10 @@ def main() -> int:
             clean_text(candidate.extra.get("category")),
             final_articles,
             config["matching"]["review_threshold"],
+            candidate,
+            config["matching"]["ambiguity_margin"],
         )
-        reasons = ["작업본에는 있으나 최종보고서에 대표·유사보도로 확인되지 않음"]
+        reasons: list[str] = []
         if not category_mapped:
             reasons.append("미포함 기사 카테고리 최종 기준 확인 필요")
         if not candidate.extra.get("profile_complete", False):
@@ -2501,7 +2868,8 @@ def main() -> int:
             "japan_match_score": round(japan_score, 4),
         }
         match_details.append(detail)
-        reviews.append({"row_number": len(rows) + 1, "row": row, **detail})
+        if reasons:
+            reviews.append({"row_number": len(rows) + 1, "row": row, **detail})
 
     for record in (item for item in confirmed_additions if item["kind"] == "omitted"):
         row, detail, reasons = addition_output(record)
@@ -2513,7 +2881,7 @@ def main() -> int:
     errors = validate_result(
         final_articles,
         rows,
-        len(omitted) + len(confirmed_additions),
+        len(omitted) + len(confirmed_additions) + len(automatic_additions),
         match_details,
     )
     if errors:
@@ -2584,6 +2952,7 @@ def main() -> int:
             "worker_candidates": len(workers),
             "omitted_workfile_articles": len(omitted),
             "confirmed_article_additions": len(confirmed_additions),
+            "automatic_article_additions": len(automatic_additions),
             "result_rows": len(rows),
             "review_rows": len(reviews),
         },
@@ -2602,6 +2971,16 @@ def main() -> int:
                 "reference_file": record["reference_file"],
             }
             for record in confirmed_additions
+        ],
+        "automatic_additions": [
+            {
+                "kind": record["kind"],
+                "after_order": record["after_order"],
+                "article": asdict(record["article"]),
+                "source_file": record["source_candidate"].source_file,
+                "evidence": record["evidence"],
+            }
+            for record in automatic_additions
         ],
         "matches": match_details,
     }

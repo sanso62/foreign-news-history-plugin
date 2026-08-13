@@ -189,9 +189,9 @@ class OriginOrderTests(unittest.TestCase):
             process_job.Article("sample.hwp", 2, "분류", "둘째 매체", "", "둘째 제목", "둘째 제목"),
         ]
         process_job.apply_front_titles(
-            articles, [{"category": "분류", "title": "편집된 묶음 제목", "media": "첫 매체/둘째 매체"}]
+            articles, [{"category": "분류", "title": "첫 제목을 편집한 묶음 제목", "media": "첫 매체/둘째 매체"}]
         )
-        self.assertEqual("편집된 묶음 제목", articles[0].canonical_title)
+        self.assertEqual("첫 제목을 편집한 묶음 제목", articles[0].canonical_title)
         self.assertTrue(articles[1].similar)
 
     def test_materially_stronger_individual_draft_beats_looser_regular_match(self):
@@ -200,7 +200,7 @@ class OriginOrderTests(unittest.TestCase):
             "현재 최종 기사 제목", "현재 최종 기사 제목",
         )
         regular = process_job.Candidate(
-            "regular", "현재 기사 제목", "현재 매체", "8.10",
+            "regular", "과거의 다른 기사 제목", "현재 매체", "8.10",
             extra={"profile_complete": True},
         )
         draft = process_job.Candidate(
@@ -353,6 +353,169 @@ class OriginOrderTests(unittest.TestCase):
         self.assertEqual(("1조", "국내", "작업자을"), (
             inferred[1].workgroup, inferred[1].owner, inferred[1].worker
         ))
+
+
+class AggregateRecoveryTests(unittest.TestCase):
+    MATCHING = {"review_threshold": 0.68, "auto_threshold": 0.82, "ambiguity_margin": 0.035}
+
+    def test_unrelated_slash_title_keeps_first_body_title(self):
+        articles = [
+            process_job.Article("sample.hwp", 1, "분류", "첫 매체", "8.3", "첫 기사", "첫 기사"),
+            process_job.Article("sample.hwp", 2, "분류", "둘째 매체", "8.3", "둘째 기사", "둘째 기사"),
+        ]
+        process_job.apply_front_titles(
+            articles,
+            [{"category": "분류", "title": "전혀 다른 주제", "media": "첫 매체/둘째 매체"}],
+        )
+        self.assertEqual("첫 기사", articles[0].canonical_title)
+        self.assertTrue(articles[0].group_representative)
+        self.assertTrue(articles[1].similar)
+
+    def test_lineage_requires_immediate_cluster_boundaries(self):
+        representative = process_job.Article(
+            "final.hwp", 1, "분류", "대표 매체", "7.22", "대표 기사", "대표 기사"
+        )
+        similar = process_job.Article(
+            "final.hwp", 2, "분류", "유사 매체", "7.22", "유사 기사", "유사 기사",
+            similar=True,
+        )
+        draft_common = {
+            "source_type": "worker", "source_file": "draft.hwp",
+            "workgroup": "1조", "owner": "국내", "worker": "작업자을",
+            "extra": {
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True,
+            },
+        }
+        direct = [
+            process_job.Candidate(title="앞 기사", media="앞 매체", date="7.22", **draft_common),
+            process_job.Candidate(title="뒤 기사", media="뒤 매체", date="7.22", **draft_common),
+        ]
+        def aggregate(title, media, order):
+            return process_job.Candidate(
+                "worker", title, media, "7.22", "aggregate.hwp",
+                extra={
+                    "source_kind": "afternoon_aggregate", "comparison_stage": "afternoon",
+                    "article_order": order, "body_title": title,
+                },
+            )
+        sequence = [
+            aggregate("앞 기사", "앞 매체", 1),
+            aggregate("무관 기사", "무관 매체", 2),
+            aggregate("대표 기사", "대표 매체", 3),
+            aggregate("유사 기사", "유사 매체", 4),
+            aggregate("뒤 기사", "뒤 매체", 5),
+        ]
+        inferred = process_job.infer_representative_draft_lineage(
+            [representative, similar], [*direct, *sequence], self.MATCHING
+        )
+        self.assertEqual({}, inferred)
+
+    def test_carried_aggregate_omission_gets_late_role(self):
+        final = process_job.Article(
+            "final.hwp", 1, "분류", "Other Wire", "8.3", "국제 정세 분석", "국제 정세 분석"
+        )
+        afternoon = process_job.Candidate(
+            "worker", "반도체 주가 급락", "Current Finance", "8.3", source_file="afternoon.hwp",
+            workgroup="오후", owner="오후/총괄", worker="작업자병",
+            extra={"source_kind": "afternoon_aggregate", "comparison_stage": "afternoon"},
+        )
+        morning = process_job.Candidate(
+            "worker", afternoon.title, afternoon.media, afternoon.date, source_file="morning 1차.hwp",
+            extra={"source_kind": "morning_aggregate", "comparison_stage": "morning"},
+        )
+        omitted = process_job.omitted_worker_candidates(
+            [final], [afternoon, morning], self.MATCHING
+        )
+        self.assertEqual(1, len(omitted))
+        self.assertEqual(("1조", "오후/총괄"), (omitted[0].workgroup, omitted[0].owner))
+        self.assertEqual("afternoon_aggregate_omitted", omitted[0].extra["source_kind"])
+
+    def test_latest_category_only_extends_a_compatible_final_category(self):
+        social = process_job.Article(
+            "final.hwp", 1, "사회", "BBC", "8.3", "폭염 기사", "폭염 기사"
+        )
+        culture = process_job.Article(
+            "final.hwp", 2, "문화", "도쿄신문", "8.3", "문화 기사", "문화 기사"
+        )
+        candidates = [
+            process_job.Candidate(
+                "worker", "폭염 기사", "BBC", "8.3", source_file="morning 2차.hwp",
+                extra={"source_kind": "morning_aggregate", "category": "사회‧문화"},
+            ),
+            process_job.Candidate(
+                "worker", "문화 기사", "도쿄신문", "8.3", source_file="morning 2차.hwp",
+                extra={"source_kind": "morning_aggregate", "category": "중동 전쟁"},
+            ),
+        ]
+        process_job.apply_latest_aggregate_categories(
+            [social, culture], candidates, 0.68, 0.82
+        )
+        self.assertEqual("사회‧문화", social.category)
+        self.assertEqual("문화", culture.category)
+
+    def test_latest_explicit_similar_row_is_recovered(self):
+        final = process_job.Article(
+            "final.hwp", 1, "경제·기업", "Bloomberg", "8.3", "대표 기사", "대표 기사",
+            body_present=True,
+        )
+        representative = process_job.Candidate(
+            "worker", "대표 기사", "Bloomberg", "8.3", source_file="morning 2차.hwp",
+            extra={
+                "source_kind": "morning_aggregate", "comparison_stage": "morning",
+                "article_order": 1, "similar": False, "category": "경제·기업",
+            },
+        )
+        similar = process_job.Candidate(
+            "worker", "명시된 유사 기사", "Reuters", "8.3", source_file="morning 2차.hwp",
+            extra={
+                "source_kind": "morning_aggregate", "comparison_stage": "morning",
+                "article_order": 2, "similar": True, "starred": True, "category": "경제·기업",
+            },
+        )
+        regular = process_job.Candidate(
+            "regular", similar.title, similar.media, similar.date,
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"profile_complete": True},
+        )
+        additions = process_job.automatic_similar_additions(
+            [final], [representative, similar],
+            {"regular": [regular], "japan": [], "worker": [representative, similar]},
+            self.MATCHING,
+        )
+        self.assertEqual(1, len(additions))
+        self.assertIs(regular, additions[0]["candidate"])
+
+    def test_latest_target_date_article_uses_late_morning_role(self):
+        article = process_job.Article(
+            "final.hwp", 1, "증시", "현재 매체", "8.3", "새 기사", "새 기사"
+        )
+        origin = process_job.Candidate(
+            "worker", "새 기사", "현재 매체", "8.3", source_file="morning 2차.hwp",
+            workgroup="2조", owner="오전/총괄", worker="작업자병",
+            extra={"source_kind": "morning_aggregate", "comparison_stage": "morning"},
+        )
+        changed = process_job.late_morning_aggregate_origin(
+            article, origin, {"regular": [], "japan": [], "worker": [origin]},
+            self.MATCHING, process_job.dt.date(2026, 8, 3),
+        )
+        self.assertEqual(("1조", "오후/총괄"), (changed.workgroup, changed.owner))
+        self.assertEqual("late_morning_aggregate", changed.extra["source_kind"])
+
+    def test_front_only_same_file_packet_stays_together(self):
+        articles = [
+            process_job.Article("f", 1, "분류", "A", "8.3", "첫째", "첫째"),
+            process_job.Article("f", 2, "분류", "B", "8.3", "둘째", "둘째"),
+            process_job.Article("f", 3, "분류", "C", "8.3", "셋째", "셋째"),
+        ]
+        rows = [["첫째"], ["둘째"], ["셋째"]]
+        details = [
+            {"origin_source_kind": "domestic_draft", "origin_file": "draft.hwp", "origin_comparison_stage": "afternoon"},
+            {"origin_source_kind": "morning_auxiliary", "origin_file": "aux.hwp", "origin_comparison_stage": "morning"},
+            {"origin_source_kind": "domestic_draft", "origin_file": "draft.hwp", "origin_comparison_stage": "afternoon"},
+        ]
+        reordered, _ = process_job.reorder_front_only_results(articles, rows, details)
+        self.assertEqual([["첫째"], ["셋째"], ["둘째"]], reordered)
 
 
 class DynamicScheduleTests(unittest.TestCase):
