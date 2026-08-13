@@ -564,6 +564,11 @@ def apply_front_titles(articles: list[Article], entries: list[dict[str, str]]) -
             article = articles[article_index]
             if entry["category"]:
                 article.category = entry["category"]
+            if position == 0:
+                # A slash group is one edited first-page entry.  Its first media
+                # is the representative and therefore inherits the group title;
+                # the following body headings retain their own similar titles.
+                article.canonical_title = entry["title"]
             if position:
                 article.similar = True
             grouped_articles.add(article_index)
@@ -659,6 +664,45 @@ def rows_from_json(path: Path) -> list[dict[str, Any]]:
     if isinstance(data, list) and (not data or isinstance(data[0], dict)):
         return [canonical_row(row) for row in data]
     raise ValueError("정기 작업내역 JSON은 values 배열 또는 행 객체 배열이어야 합니다.")
+
+
+def source_scan_audit_errors(path: Path, target_date: dt.date) -> list[str]:
+    """Check that history came from a bounded formatted-value range scan."""
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict):
+        return ["정기 작업내역 조회 감사정보가 없음"]
+    audit = data.get("source_audit")
+    if not isinstance(audit, dict):
+        return ["정기 작업내역 조회 감사정보가 없음"]
+    errors: list[str] = []
+    if int(audit.get("schema_version", 0) or 0) < 2:
+        errors.append("정기 작업내역 조회 감사정보 버전이 오래됨")
+    if clean_text(audit.get("retrieval_method")) != "bounded_range_scan":
+        errors.append("정기 작업내역을 bounded range scan으로 조회하지 않음")
+    if clean_text(audit.get("value_render_option")) != "FORMATTED_VALUE":
+        errors.append("정기 작업내역 표시값 조회가 아님")
+    if clean_text(audit.get("target_date")) != target_date.isoformat():
+        errors.append("정기 작업내역 조회 대상일이 작업일 전날과 다름")
+    scan_ranges = audit.get("scan_ranges")
+    if not isinstance(scan_ranges, list) or not scan_ranges:
+        scan_ranges = [audit.get("scan_range")]
+    if any(
+        not re.search(r"(?:^|!)[A-Z]+\d+:[A-Z]+\d+$", clean_text(scan_range))
+        for scan_range in scan_ranges
+    ):
+        errors.append("정기 작업내역 조회 범위가 유한한 A1 범위가 아님")
+    values = data.get("values")
+    matched = max(0, len(values) - 1) if isinstance(values, list) else -1
+    try:
+        recorded_matched = int(audit.get("matched_row_count", -1))
+        scanned = int(audit.get("scanned_row_count", 0))
+    except (TypeError, ValueError):
+        recorded_matched, scanned = -1, 0
+    if matched < 0 or recorded_matched != matched:
+        errors.append("정기 작업내역 조회 감사 행 수와 실제 행 수가 다름")
+    if scanned < matched:
+        errors.append("정기 작업내역 스캔 행 수가 일치 행 수보다 작음")
+    return errors
 
 
 def profile_fields(profile: dict[str, Any] | None) -> tuple[str, str, str]:
@@ -796,7 +840,12 @@ def regular_candidates(
     profile: dict[str, Any] | None,
     valid_schedule_refs: dict[str, str] | set[str] | None = None,
     require_schedule: bool = False,
+    require_scan_audit: bool = False,
 ) -> tuple[list[Candidate], list[str]]:
+    if require_scan_audit:
+        audit_errors = source_scan_audit_errors(path, target_date)
+        if audit_errors:
+            raise ValueError("; ".join(audit_errors))
     rows = rows_from_json(path)
     headers = set(rows[0]) if rows else set()
     warnings: list[str] = []
@@ -1053,12 +1102,53 @@ def enrich_special_source_roles(
     worker_candidates: list[Candidate],
     matching: dict[str, float],
 ) -> list[Candidate]:
-    """Keep a special workgroup while deriving its actual edit owner/worker.
+    """Keep a special workgroup while deriving its set-level editor.
 
-    Japan-report articles retain the workflow's `일본문화원` workgroup.  Their
-    owner and worker can vary by article, so they are copied only from a matching,
-    schedule-backed current work file in chronological stage order.
+    A Japan report is assigned as one work packet.  Some days its articles are
+    carried by an auxiliary file and on other days the aggregate editor imports
+    the complete packet.  Choose the current, schedule-backed file that covers
+    the most supplied Japan articles instead of assigning different editors per
+    article.
     """
+    eligible_workers = [
+        item for item in worker_candidates if item.extra.get("profile_complete", False)
+    ]
+    file_scores: list[tuple[int, float, int, str, Candidate]] = []
+    for source_file in dict.fromkeys(item.source_file for item in eligible_workers):
+        current = [item for item in eligible_workers if item.source_file == source_file]
+        matched_scores: list[float] = []
+        for candidate in candidates:
+            probe = Article(
+                source_file=candidate.source_file,
+                order=0,
+                category="",
+                media=candidate.media,
+                date=candidate.date,
+                body_title=candidate.title,
+                canonical_title=candidate.title,
+            )
+            ranked = ranked_matches(probe, current)
+            if ranked and ranked[0][0] >= matching["review_threshold"]:
+                matched_scores.append(ranked[0][0])
+        if matched_scores:
+            representative = current[0]
+            stage = clean_text(representative.extra.get("comparison_stage"))
+            stage_order = 1 if stage == "afternoon" else 0
+            file_scores.append((
+                len(matched_scores),
+                sum(matched_scores) / len(matched_scores),
+                stage_order,
+                source_file,
+                representative,
+            ))
+    selected: Candidate | None = None
+    selected_stage = ""
+    selected_score = 0.0
+    coverage = 0
+    if file_scores:
+        coverage, selected_score, _, _, selected = max(file_scores, key=lambda item: item[:3])
+        selected_stage = clean_text(selected.extra.get("comparison_stage"))
+
     enriched: list[Candidate] = []
     for candidate in candidates:
         existing_errors = role_semantic_errors(
@@ -1076,33 +1166,6 @@ def enrich_special_source_roles(
         ):
             enriched.append(candidate)
             continue
-        probe = Article(
-            source_file=candidate.source_file,
-            order=0,
-            category="",
-            media=candidate.media,
-            date=candidate.date,
-            body_title=candidate.title,
-            canonical_title=candidate.title,
-        )
-        selected: Candidate | None = None
-        selected_score = 0.0
-        selected_stage = ""
-        for stage in FIXED_COMPARISON_ORDER[1:]:
-            stage_candidates = [
-                item for item in worker_candidates
-                if clean_text(item.extra.get("comparison_stage")) == stage
-                and item.extra.get("profile_complete", False)
-            ]
-            ranked = ranked_origin_matches(
-                probe,
-                stage_candidates,
-                matching["review_threshold"],
-            )
-            if ranked:
-                selected_score, selected = ranked[0]
-                selected_stage = stage
-                break
         if selected is None:
             enriched.append(candidate)
             continue
@@ -1111,8 +1174,8 @@ def enrich_special_source_roles(
         evidence = list(candidate.extra.get("profile_evidence", []))
         evidence.extend(selected.extra.get("profile_evidence", []))
         evidence.append(
-            f"특수 유입 기사의 실제 편집 작업본 대조: {selected_stage} "
-            f"{Path(selected.source_file).name} (점수 {selected_score:.3f})"
+            f"일본동향 전체 기사 취급 파일 대조: {selected_stage} "
+            f"{Path(selected.source_file).name} (일치 {coverage}건, 평균 {selected_score:.3f})"
         )
         extra = {
             **candidate.extra,
@@ -1471,6 +1534,25 @@ def japan_membership(
     confirmed, reasons = confirmed_japan_candidate(candidates, confirmation)
     if confirmed:
         return True, candidate_score(article, confirmed), []
+    review_candidates: list[tuple[float, Candidate]] = []
+    for candidate in candidates:
+        if media_similarity(article.media, candidate.media) < 0.85:
+            continue
+        article_date = parse_date(article.date)
+        candidate_date = parse_date(candidate.date)
+        near_date = (
+            not article_date
+            or not candidate_date
+            or abs((article_date - candidate_date).days) <= 1
+        )
+        if near_date:
+            review_candidates.append((candidate_score(article, candidate), candidate))
+    if len(review_candidates) == 1:
+        score, candidate = review_candidates[0]
+        reasons.append(
+            "일본동향 동일 매체·인접 날짜 저점수 후보 직접 대조 필요: "
+            f"{candidate.title} (점수 {score:.3f})"
+        )
     return False, automatic_score, [*exclusion_reasons, *reasons]
 
 
@@ -1822,6 +1904,7 @@ def main() -> int:
         source_profiles.get("regular"),
         valid_schedule_refs,
         require_schedule,
+        bool(config.get("inference", {}).get("require_source_scan_audit", False)),
     )
     warnings.extend(regular_warnings)
     workers, worker_files, worker_warnings = worker_candidates(

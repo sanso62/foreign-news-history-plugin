@@ -32,9 +32,52 @@ process_job = sys.modules.get("process_job") or load_module("process_job", "proc
 discover_context = load_module("safety_discover_context", "discover_context.py")
 reference_feedback = load_module("safety_reference_feedback", "apply_reference_feedback.py")
 sheet_sync_guard = load_module("safety_sheet_sync_guard", "sheet_sync_guard.py")
+prepare_source_history = load_module("safety_prepare_source_history", "prepare_source_history.py")
 
 
 class SafetyGuardTests(unittest.TestCase):
+    def test_source_history_filters_formatted_dates_and_records_audit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.json"
+            output = Path(temp_dir) / "output.json"
+            source.write_text(json.dumps({
+                "range": "'작업내역'!A1:C4",
+                "values": [
+                    ["보도일", "보도시각 (KST)", "제목 (한글)"],
+                    ["2026. 7. 22", "9:00", "첫 기사"],
+                    ["2026-07-22", "10:00", "둘째 기사"],
+                    ["2026. 7. 21", "11:00", "제외 기사"],
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(sys, "argv", [
+                "prepare_source_history.py", "--input", str(source),
+                "--target-date", "2026-07-22", "--spreadsheet-id", "current",
+                "--sheet-name", "작업내역", "--output", str(output),
+            ]):
+                self.assertEqual(0, prepare_source_history.main())
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(2, payload["source_audit"]["matched_row_count"])
+            self.assertEqual([], process_job.source_scan_audit_errors(
+                output, process_job.dt.date(2026, 7, 22)
+            ))
+
+    def test_source_history_rejects_row_search_audit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.json"
+            source.write_text(json.dumps({
+                "source_audit": {
+                    "schema_version": 2, "retrieval_method": "row_search",
+                    "value_render_option": "FORMATTED_VALUE", "target_date": "2026-07-22",
+                    "scan_range": "'작업내역'!A1:K1000", "scanned_row_count": 1,
+                    "matched_row_count": 1,
+                },
+                "values": [["보도일", "제목 (한글)"], ["2026. 7. 22", "기사"]],
+            }, ensure_ascii=False), encoding="utf-8")
+            errors = process_job.source_scan_audit_errors(
+                source, process_job.dt.date(2026, 7, 22)
+            )
+            self.assertTrue(any("bounded range scan" in error for error in errors))
+
     def test_output_cleanup_handles_compact_prefix_and_unbalanced_quote(self):
         self.assertEqual(process_job.display_media("중 가상매체"), "가상매체")
         self.assertEqual(process_job.display_media("New Example News"), "New Example News")

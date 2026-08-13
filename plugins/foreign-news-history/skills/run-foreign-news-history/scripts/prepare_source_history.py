@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Filter a bounded Google Sheets range scan to the required report date.
+
+The connector must read FORMATTED_VALUE cells.  This script parses those visible
+values locally so a guessed search string can never silently produce a partial
+regular-history set.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+from pathlib import Path
+from typing import Any
+
+from process_job import SOURCE_HEADERS, clean_text, parse_date
+
+
+def canonical_header(value: Any) -> str:
+    compact = "".join(clean_text(value).replace("TINY URL", "").split()).replace("*", "")
+    for expected in SOURCE_HEADERS:
+        if compact == "".join(expected.split()).replace("*", ""):
+            return expected
+    return clean_text(value)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="작업내역 표시값 범위 조회 결과를 대상일로 필터링")
+    parser.add_argument("--input", required=True, help="Google Sheets bounded range 응답 JSON")
+    parser.add_argument("--target-date", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--spreadsheet-id", required=True)
+    parser.add_argument("--sheet-name", required=True)
+    parser.add_argument("--output", required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    input_path = Path(args.input).resolve()
+    output_path = Path(args.output).resolve()
+    target_date = dt.date.fromisoformat(args.target_date)
+    raw = json.loads(input_path.read_text(encoding="utf-8-sig"))
+    chunks = raw.get("chunks") if isinstance(raw, dict) else None
+    if not isinstance(chunks, list):
+        chunks = [raw]
+    scan_ranges: list[str] = []
+    values: list[list[Any]] = []
+    for chunk in chunks:
+        chunk_values = chunk.get("values") if isinstance(chunk, dict) else None
+        chunk_range = clean_text(chunk.get("range")) if isinstance(chunk, dict) else ""
+        if not isinstance(chunk_values, list) or not chunk_values or not isinstance(chunk_values[0], list):
+            raise ValueError("작업내역 범위 조회 JSON에 values 2차원 배열이 없습니다.")
+        if not chunk_range:
+            raise ValueError("작업내역 범위 조회 JSON에 실제 scan range가 없습니다.")
+        scan_ranges.append(chunk_range)
+        if not values:
+            values.extend(chunk_values)
+        else:
+            header = [canonical_header(value) for value in values[0]]
+            incoming_header = [canonical_header(value) for value in chunk_values[0]]
+            values.extend(chunk_values[1:] if incoming_header == header else chunk_values)
+    headers = [canonical_header(value) for value in values[0]]
+    if "보도일" not in headers or "제목 (한글)" not in headers:
+        raise ValueError("작업내역 범위 조회에 필수 열 보도일/제목 (한글)이 없습니다.")
+    date_index = headers.index("보도일")
+    filtered = [
+        row for row in values[1:]
+        if date_index < len(row) and parse_date(row[date_index]) == target_date
+    ]
+    if not filtered:
+        raise ValueError(f"작업내역 전체 범위에서 {target_date.isoformat()} 행을 찾지 못했습니다.")
+    payload = {
+        "source_audit": {
+            "schema_version": 2,
+            "retrieval_method": "bounded_range_scan",
+            "value_render_option": "FORMATTED_VALUE",
+            "spreadsheet_id": clean_text(args.spreadsheet_id),
+            "sheet_name": clean_text(args.sheet_name),
+            "scan_range": scan_ranges[0] if len(scan_ranges) == 1 else "",
+            "scan_ranges": scan_ranges,
+            "target_date": target_date.isoformat(),
+            "scanned_row_count": max(0, len(values) - 1),
+            "matched_row_count": len(filtered),
+            "source_file": str(input_path),
+        },
+        "values": [headers, *filtered],
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"output": str(output_path), "matched_rows": len(filtered)}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

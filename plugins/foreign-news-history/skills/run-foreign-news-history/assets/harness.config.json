@@ -21,6 +21,7 @@
     "require_fresh_context": true,
     "require_evidence": true,
     "require_schedule_evidence_for_roles": true,
+    "require_source_scan_audit": true,
     "unresolved_policy": "review"
   }
 }

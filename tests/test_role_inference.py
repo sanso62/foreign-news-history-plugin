@@ -154,6 +154,44 @@ class OriginOrderTests(unittest.TestCase):
         self.assertEqual(("글로벌", "작업자갑"), (result.owner, result.worker))
         self.assertTrue(result.extra["profile_complete"])
 
+    def test_japan_packet_uses_file_covering_complete_set(self):
+        japan = [
+            process_job.Candidate("japan", "첫 기사", "첫 매체", "8.4", workgroup="일본문화원"),
+            process_job.Candidate("japan", "둘째 기사", "둘째 매체", "8.4", workgroup="일본문화원"),
+        ]
+        auxiliary = process_job.Candidate(
+            "worker", "첫 기사", "첫 매체", "8.4", source_file="aux.hwp",
+            owner="보조", worker="작업자정", extra={
+                "comparison_stage": "morning", "profile_complete": True,
+                "source_kind": "morning_auxiliary", "schedule_refs": ["근무!6"],
+            },
+        )
+        aggregate = [
+            process_job.Candidate(
+                "worker", title, media, "8.4", source_file="aggregate.hwp",
+                owner="오전/총괄", worker="작업자병", extra={
+                    "comparison_stage": "morning", "profile_complete": True,
+                    "source_kind": "morning_aggregate", "schedule_refs": ["근무!5"],
+                },
+            )
+            for title, media in (("첫 기사", "첫 매체"), ("둘째 기사", "둘째 매체"))
+        ]
+        result = process_job.enrich_special_source_roles(
+            japan, [auxiliary, *aggregate], {"review_threshold": 0.5}
+        )
+        self.assertEqual({("오전/총괄", "작업자병")}, {(item.owner, item.worker) for item in result})
+
+    def test_slash_group_sets_representative_title(self):
+        articles = [
+            process_job.Article("sample.hwp", 1, "분류", "첫 매체", "8.3", "첫 제목", "첫 제목"),
+            process_job.Article("sample.hwp", 2, "분류", "둘째 매체", "", "둘째 제목", "둘째 제목"),
+        ]
+        process_job.apply_front_titles(
+            articles, [{"category": "분류", "title": "편집된 묶음 제목", "media": "첫 매체/둘째 매체"}]
+        )
+        self.assertEqual("편집된 묶음 제목", articles[0].canonical_title)
+        self.assertTrue(articles[1].similar)
+
 
 class DynamicScheduleTests(unittest.TestCase):
     def setUp(self):
