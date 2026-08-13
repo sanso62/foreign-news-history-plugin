@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Collect current-run evidence without assigning people, teams, or categories.
+"""Collect current-run evidence and apply the documented file-stage role rules.
 
-Codex reviews this draft together with schedule/source evidence and writes the final
-run_context.json.  No previous-day personnel mapping is reused.
+Role labels come from the workflow prompt.  Worker names are never hard-coded: a
+name is accepted only when the current filename and the same-day schedule row agree.
+No previous-day personnel mapping is reused.
 """
 
 from __future__ import annotations
@@ -27,6 +28,164 @@ from process_job import (
 )
 
 
+AGGREGATE_REVISION = re.compile(r"(?:^|[ _-])(?:\d+|[nN])차(?:$|[ _-])|최종")
+
+
+def marker(value: Any) -> str:
+    """Normalize a short filename/schedule marker for containment checks."""
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", clean_text(value)).casefold()
+
+
+def schedule_assignment_matches(source_kind: str, assignment: dict[str, Any]) -> bool:
+    report = marker(assignment.get("report"))
+    division = marker(assignment.get("division"))
+    if source_kind == "global_draft":
+        return "글로벌" in report and division == "오후"
+    if source_kind == "domestic_draft":
+        return ("한국관련" in report or "국내" in report) and division == "오후"
+    if source_kind in {"afternoon_aggregate", "morning_aggregate"}:
+        return "일일동향" in report and division == "총괄"
+    if source_kind == "morning_auxiliary":
+        return "일일동향" in report and division in {"새벽", "보조"}
+    return False
+
+
+def infer_file_profile(
+    path: Path,
+    comparison_stage: str,
+    schedule: dict[str, Any],
+) -> dict[str, Any]:
+    """Infer stage labels and validate the filename worker against today's schedule."""
+    stem = clean_text(path.stem)
+    stem_marker = marker(stem)
+    evidence: list[str] = []
+    if comparison_stage == "afternoon":
+        if "글로벌이슈" in stem_marker or "글로벌동향" in stem_marker:
+            source_kind, workgroup, owner, include_unmatched, priority = (
+                "global_draft", "1조", "글로벌", True, 100
+            )
+            evidence.append("프롬프트 역할 기준: 오후 글로벌 이슈 작업본 → 1조/글로벌")
+        elif "취합" in stem_marker:
+            source_kind, workgroup, owner, include_unmatched, priority = (
+                "afternoon_aggregate", "1조", "오후/총괄", False, 10
+            )
+            evidence.append("프롬프트 역할 기준: 오후 취합본 → 1조/오후/총괄")
+        else:
+            source_kind, workgroup, owner, include_unmatched, priority = (
+                "domestic_draft", "1조", "국내", True, 100
+            )
+            evidence.append("프롬프트 역할 기준: 오후 개별 국내 초안 → 1조/국내")
+    elif comparison_stage == "morning":
+        if AGGREGATE_REVISION.search(stem):
+            source_kind, workgroup, owner, include_unmatched, priority = (
+                "morning_aggregate", "2조", "오전/총괄", False, 10
+            )
+            evidence.append("프롬프트 역할 기준: 오전 n차·최종 총괄본 → 2조/오전/총괄")
+        else:
+            source_kind, workgroup, owner, include_unmatched, priority = (
+                "morning_auxiliary", "2조", "보조", True, 100
+            )
+            evidence.append("프롬프트 역할 기준: 오전 보조·초안 작업본 → 2조/보조")
+    else:
+        return {
+            "source_kind": "",
+            "workgroup": "",
+            "owner": "",
+            "worker": "",
+            "priority": 0,
+            "include_unmatched": False,
+            "confidence": "unresolved",
+            "evidence": [],
+            "schedule_refs": [],
+        }
+
+    if "순방" in stem_marker:
+        workgroup = "순방"
+        evidence.append("프롬프트 특수 유입 기준: 파일명에 순방 업무가 명시됨 → 작업조 순방")
+
+    matches: list[dict[str, Any]] = []
+    for assignment in schedule.get("assignments", []):
+        if not isinstance(assignment, dict) or not schedule_assignment_matches(source_kind, assignment):
+            continue
+        worker = clean_text(assignment.get("worker"))
+        if worker and marker(worker) in stem_marker:
+            matches.append(assignment)
+
+    worker = ""
+    schedule_refs: list[str] = []
+    confidence = "unresolved"
+    if len(matches) == 1:
+        assignment = matches[0]
+        worker = clean_text(assignment.get("worker"))
+        ref = clean_text(assignment.get("ref"))
+        schedule_refs = [ref] if ref else []
+        evidence.extend([
+            f"파일명에 작업자 '{worker}'가 명시됨: {path.name}",
+            f"{ref}: {clean_text(assignment.get('report'))}/{clean_text(assignment.get('division'))} 담당자 {worker}",
+        ])
+        confidence = "confirmed" if schedule_refs else "unresolved"
+    elif len(matches) > 1:
+        evidence.append("파일명 작업자와 일치하는 당일 근무 행이 둘 이상이어서 작업자 확인 필요")
+    else:
+        evidence.append("파일명과 해당 역할의 당일 근무 행에서 같은 작업자를 확인하지 못함")
+
+    return {
+        "source_kind": source_kind,
+        "workgroup": workgroup,
+        "owner": owner,
+        "worker": worker,
+        "priority": priority,
+        "include_unmatched": include_unmatched,
+        "confidence": confidence,
+        "evidence": evidence,
+        "schedule_refs": schedule_refs,
+    }
+
+
+def aggregate_profile(
+    files: list[dict[str, Any]],
+    source_kind: str,
+    workgroup: str,
+    owner: str,
+    rule_evidence: str,
+) -> dict[str, Any]:
+    """Build a regular/final profile from uniquely identified aggregate workers."""
+    matches = [
+        item for item in files
+        if item.get("source_kind") == source_kind
+        and clean_text(item.get("worker"))
+        and item.get("schedule_refs")
+    ]
+    workers = {clean_text(item.get("worker")) for item in matches}
+    if len(workers) != 1:
+        return {
+            "workgroup": workgroup,
+            "owner": owner,
+            "worker": "",
+            "priority": 0,
+            "confidence": "unresolved",
+            "evidence": [rule_evidence, "해당 총괄 파일의 당일 작업자를 하나로 확정하지 못함"],
+            "schedule_refs": [],
+        }
+    worker = next(iter(workers))
+    refs = list(dict.fromkeys(
+        clean_text(ref)
+        for item in matches
+        for ref in item.get("schedule_refs", [])
+        if clean_text(ref)
+    ))
+    filenames = ", ".join(item.get("filename", "") for item in matches)
+    return {
+        "workgroup": workgroup,
+        "owner": owner,
+        "worker": worker,
+        "priority": 0,
+        "confidence": "confirmed" if refs else "unresolved",
+        "evidence": [rule_evidence, f"총괄 파일과 당일 근무표 대조: {filenames}"],
+        "schedule_refs": refs,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="현재 입력 파일의 실행 컨텍스트 근거 수집")
     parser.add_argument("--morning-dir", required=True)
@@ -43,6 +202,7 @@ def document_signal(
     path: Path,
     root: Path | None = None,
     comparison_stage: str = "",
+    schedule: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         paragraphs = extract_paragraphs(path)
@@ -55,7 +215,7 @@ def document_signal(
     else:
         error = ""
     relative = str(path.relative_to(root)) if root and path.is_relative_to(root) else path.name
-    return {
+    signal = {
         "path": str(path.resolve()),
         "relative_path": relative,
         "filename": path.name,
@@ -76,6 +236,9 @@ def document_signal(
         "evidence": [],
         "schedule_refs": [],
     }
+    if comparison_stage and schedule:
+        signal.update(infer_file_profile(path, comparison_stage, schedule))
+    return signal
 
 
 def main() -> int:
@@ -127,6 +290,27 @@ def main() -> int:
         ]
     except Exception:
         final_articles = []
+    files = [
+        document_signal(path, morning, "morning", schedule)
+        if path.is_relative_to(morning)
+        else document_signal(path, afternoon, "afternoon", schedule)
+        for path in work_files
+    ]
+    regular_profile = aggregate_profile(
+        files,
+        "afternoon_aggregate",
+        "정기",
+        "오후/총괄",
+        "프롬프트 역할 기준: 정기 유입 → 정기/오후/총괄, 작업자는 당일 오후 취합 작업자",
+    )
+    final_profile = aggregate_profile(
+        files,
+        "morning_aggregate",
+        "",
+        "오전/총괄",
+        "프롬프트 역할 기준: 최종 대표기사 → 오전/총괄, 작업자는 당일 오전 총괄 작업자",
+    )
+    japan_evidence = "사용자가 명시한 같은 작업일의 일본언론동향 원본을 확인함: " + str(japan)
     draft = {
         "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "input_fingerprint": run_fingerprint(all_inputs),
@@ -140,43 +324,26 @@ def main() -> int:
             "local_path": str(schedule_json),
             "sha256": sha256_file(schedule_json),
         },
-        "final": {
-            "workgroup": "",
-            "owner": "",
-            "worker": "",
-            "confidence": "unresolved",
-            "evidence": [],
-            "schedule_refs": [],
-        },
+        "final": final_profile,
         "final_disposition": {
-            "not_representative_owner": "",
-            "confidence": "unresolved",
-            "evidence": [],
+            "not_representative_owner": "최종 보고서 미포함",
+            "confidence": "confirmed",
+            "evidence": ["프롬프트 역할 기준: 유사보도·완전 미포함 기사의 최종 담당 표기"],
         },
         "sources": {
-            "regular": {
-                "workgroup": "",
-                "owner": "",
-                "worker": "",
-                "priority": 0,
-                "confidence": "unresolved",
-                "evidence": [],
-                "schedule_refs": [],
-            },
+            "regular": regular_profile,
             "japan": {
                 "status": "present_checked",
-                "workgroup": "",
+                "workgroup": "일본문화원",
                 "owner": "",
                 "worker": "",
                 "priority": 0,
                 "confidence": "unresolved",
-                "evidence": [
-                    "사용자가 명시한 같은 작업일의 일본언론동향 원본을 확인함: " + str(japan)
-                ],
+                "evidence": [japan_evidence, "프롬프트 특수 유입 기준: 일본언론동향 → 작업조 일본문화원"],
                 "schedule_refs": [],
             },
         },
-        "comparison_order": ["regular_and_japan", "morning", "afternoon"],
+        "comparison_order": ["regular_and_japan", "afternoon", "morning"],
         "final_report_signal": document_signal(final_report, final_report.parent),
         "japan_input": {
             "status": "present_checked",
@@ -184,20 +351,15 @@ def main() -> int:
             "files": [document_signal(path, japan.parent) for path in japan_files],
         },
         "final_articles": final_articles,
-        "files": [
-            document_signal(path, morning, "morning")
-            if path.is_relative_to(morning)
-            else document_signal(path, afternoon, "afternoon")
-            for path in work_files
-        ],
+        "files": files,
         "article_overrides": [],
         "article_japan_confirmations": [],
         "decision_notes": [
-            "Codex가 현재 실행의 파일·문서·스케줄 근거만 사용해 빈 필드를 채운다.",
+            "프롬프트에 명시된 파일 단계별 역할 표기를 적용하고, 작업자는 현재 파일명과 당일 근무표가 일치할 때만 확정한다.",
             "작업조·초벌 담당·초벌 작업자·최종 담당·최종 작업자는 schedule_refs로 근무 시트의 당일 요일 행을 인용한다.",
             "이전 실행의 사람·조 매핑을 복사하지 않는다.",
             "일본언론동향 원본 수록 기사만 일일일본동향 O로 판정하며, 제목이 크게 바뀐 동일 기사는 article_japan_confirmations에 현재 원문 대조 근거를 기록한다.",
-            "최종보고서 기사 유입 경로는 정기 작업내역·일본동향, 오전폴더, 오후폴더 순서로 비교한다. 정기와 일본동향이 겹치면 정기를 선택하고 일본동향 O는 유지한다.",
+            "최종보고서 기사 유입 경로는 정기 작업내역·일본동향, 오후폴더, 오전폴더 순서로 비교한다. 정기와 일본동향이 겹치면 정기를 선택하고 일본동향 O는 유지한다.",
             "근거가 없으면 빈 값과 unresolved를 유지한다.",
         ],
     }

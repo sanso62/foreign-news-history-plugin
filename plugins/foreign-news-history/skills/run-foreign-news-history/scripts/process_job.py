@@ -56,10 +56,10 @@ SOURCE_HEADERS = [
     "제목 (한글)",
 ]
 
-# Human comparison workflow: reference sources first, then the morning folder,
-# then the afternoon folder.  This order is an operational rule, not an
+# Human comparison workflow: reference sources first, then the afternoon folder,
+# then the morning folder.  This order is an operational rule, not an
 # execution-specific inference, so run_context priorities must never reorder it.
-FIXED_COMPARISON_ORDER = ("reference", "morning", "afternoon")
+FIXED_COMPARISON_ORDER = ("reference", "afternoon", "morning")
 REFERENCE_SOURCE_ORDER = ("regular", "japan")
 
 ARTICLE_HEADING = re.compile(r"^\s*(?P<star>\*)?\s*<(?P<meta>[^>]+)>\s*(?P<title>.+?)\s*$")
@@ -901,6 +901,71 @@ def ranked_origin_matches(
     )
 
 
+def enrich_special_source_roles(
+    candidates: list[Candidate],
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> list[Candidate]:
+    """Keep a special workgroup while deriving its actual edit owner/worker.
+
+    Japan-report articles retain the workflow's `일본문화원` workgroup. Their
+    owner and worker can vary by article, so they are copied only from a matching,
+    schedule-backed current work file in chronological stage order.
+    """
+    enriched: list[Candidate] = []
+    for candidate in candidates:
+        if candidate.owner and candidate.worker and candidate.extra.get("profile_complete"):
+            enriched.append(candidate)
+            continue
+
+        probe = Article(
+            source_file=candidate.source_file,
+            order=0,
+            category=clean_text(candidate.extra.get("category")),
+            media=candidate.media,
+            date=candidate.date,
+            body_title=candidate.title,
+            canonical_title=candidate.title,
+        )
+        selected: Candidate | None = None
+        selected_score = 0.0
+        selected_stage = ""
+        for stage in FIXED_COMPARISON_ORDER[1:]:
+            stage_candidates = [
+                item
+                for item in worker_candidates
+                if clean_text(item.extra.get("comparison_stage")) == stage
+                and item.extra.get("profile_complete")
+            ]
+            ranked = ranked_origin_matches(probe, stage_candidates, matching["review_threshold"])
+            if ranked:
+                selected_score, selected = ranked[0]
+                selected_stage = stage
+                break
+
+        if selected is None:
+            enriched.append(candidate)
+            continue
+
+        refs = list(selected.extra.get("schedule_refs", []))
+        evidence = list(candidate.extra.get("profile_evidence", []))
+        evidence.extend(selected.extra.get("profile_evidence", []))
+        evidence.append(
+            "특수 유입 기사의 실제 편집 작업본 대조: "
+            f"{selected_stage} {Path(selected.source_file).name} (점수 {selected_score:.3f})"
+        )
+        extra = {
+            **candidate.extra,
+            "profile_complete": bool(candidate.workgroup and selected.owner and selected.worker and refs),
+            "profile_evidence": list(dict.fromkeys(clean_text(item) for item in evidence if clean_text(item))),
+            "schedule_refs": refs,
+            "actual_edit_stage": selected_stage,
+            "actual_edit_file": selected.source_file,
+        }
+        enriched.append(replace(candidate, owner=selected.owner, worker=selected.worker, extra=extra))
+    return enriched
+
+
 def choose_origin(
     article: Article,
     pools: dict[str, list[Candidate]],
@@ -1512,6 +1577,7 @@ def main() -> int:
         require_schedule,
     )
     warnings.extend(japan_warnings)
+    japan = enrich_special_source_roles(japan, workers, config["matching"])
     final_profile = run_context.get("final")
     final_profile_complete = profile_is_complete(
         final_profile,
