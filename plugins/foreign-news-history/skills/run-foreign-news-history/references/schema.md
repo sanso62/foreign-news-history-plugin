@@ -55,6 +55,7 @@ Google Sheets와 엑셀의 열 순서는 정확히 다음 `A:O`를 사용한다.
 - `동향스케줄.json`: 매 실행 `근무` 탭의 현재 그리드에서 `동향 스케줄` 제목과 헤더를 동적으로 찾은 뒤 작업일 요일 열을 선택한 보고서·구분·담당자 및 원본 행·셀 근거. 스키마 버전 2이며 실제 조회 범위, `heading_cell`, `header_cell`, 각 행의 `report_cell`, `division_cell`, `publication_schedule_cell`, `worker_cell`을 포함한다.
 
 `intermediate_saved` 전에는 Google Sheets에 쓰지 않는다.
+`checkpoint.json`의 `review_rows`가 0이 아니면 Google Sheets에 쓰지 않는다. 현재 원문이나 같은 작업일의 해시 검증된 기준표 확인값으로 보완한 뒤 결과와 중간 엑셀을 다시 생성한다.
 
 사람·사람별 작업조·담당·카테고리·매체 별칭은 이 스키마나 전역 설정에 저장하지 않는다. 업무 프롬프트에 명시된 파일 단계별 역할 표기는 허용되는 판정 규칙이며, 현재 실행의 사람은 `references/run-context.md` 구조에 따라 파일명과 당일 근무표로 확인한다.
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib
+import importlib.util
 import json
 import re
 import sys
@@ -57,10 +59,23 @@ SOURCE_HEADERS = [
 ]
 
 # Human comparison workflow: reference sources first, then the afternoon folder,
-# then the morning folder.  This order is an operational rule, not an
+# then the morning folder.  This is chronological first-inflow order, not an
 # execution-specific inference, so run_context priorities must never reorder it.
 FIXED_COMPARISON_ORDER = ("reference", "afternoon", "morning")
 REFERENCE_SOURCE_ORDER = ("regular", "japan")
+
+# These are workflow-stage labels, not person mappings.  They are intentionally
+# fixed because they define the meaning of the result columns.
+WORKFILE_ROLE_LABELS = {
+    "domestic_draft": ("1조", "국내"),
+    "global_draft": ("1조", "글로벌"),
+    "afternoon_aggregate": ("1조", "오후/총괄"),
+    "morning_auxiliary": ("2조", "보조"),
+    "morning_aggregate": ("2조", "오전/총괄"),
+}
+REFERENCE_ROLE_LABELS = {
+    "regular": ("정기", "오후/총괄"),
+}
 
 ARTICLE_HEADING = re.compile(r"^\s*(?P<star>\*)?\s*<(?P<meta>[^>]+)>\s*(?P<title>.+?)\s*$")
 DATE_IN_META = re.compile(r"(?<!\d)(?P<month>\d{1,2})\.(?P<day>\d{1,2})(?!\d)")
@@ -204,11 +219,30 @@ def extract_hwpx(path: Path) -> list[str]:
     return paragraphs
 
 
+def load_olefile_module() -> Any:
+    """Load olefile from the runtime or the plugin's redistribution copy."""
+    try:
+        return importlib.import_module("olefile")
+    except ImportError:
+        vendor_path = Path(__file__).resolve().parent / "_vendor" / "olefile.py"
+        if not vendor_path.is_file():
+            raise RuntimeError(
+                "HWP 읽기 모듈을 찾지 못했습니다. 플러그인에 포함된 olefile 배포본을 확인하세요."
+            )
+        spec = importlib.util.spec_from_file_location("foreign_news_history_olefile", vendor_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("플러그인에 포함된 HWP 읽기 모듈을 불러오지 못했습니다.")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault(spec.name, module)
+        spec.loader.exec_module(module)
+        return module
+
+
 def extract_hwp(path: Path) -> list[str]:
     try:
-        import olefile  # type: ignore
-    except ImportError as exc:  # pragma: no cover - environment error
-        raise RuntimeError("HWP 읽기에 olefile 패키지가 필요합니다.") from exc
+        olefile = load_olefile_module()
+    except Exception as exc:  # pragma: no cover - packaging error
+        raise RuntimeError(f"HWP 읽기 모듈 초기화 실패: {exc}") from exc
 
     paragraphs: list[str] = []
     with olefile.OleFileIO(str(path)) as ole:
@@ -614,6 +648,59 @@ def profile_fields(profile: dict[str, Any] | None) -> tuple[str, str, str]:
     )
 
 
+def role_semantic_errors(
+    source_type: str,
+    source_kind: str,
+    workgroup: str,
+    owner: str,
+    actual_edit_source_kind: str = "",
+) -> list[str]:
+    """Validate that role labels describe the selected current-run source."""
+    source_type = clean_text(source_type)
+    source_kind = clean_text(source_kind)
+    workgroup = clean_text(workgroup)
+    owner = clean_text(owner)
+    actual_edit_source_kind = clean_text(actual_edit_source_kind)
+    errors: list[str] = []
+
+    if source_type in REFERENCE_ROLE_LABELS:
+        expected_group, expected_owner = REFERENCE_ROLE_LABELS[source_type]
+        if workgroup and workgroup != expected_group:
+            errors.append(f"{source_type} 작업조는 {expected_group}이어야 함")
+        if owner and owner != expected_owner:
+            errors.append(f"{source_type} 초벌 담당은 {expected_owner}이어야 함")
+        return errors
+
+    if source_type == "worker":
+        expected = WORKFILE_ROLE_LABELS.get(source_kind)
+        if expected is None:
+            return [f"작업자 파일 source_kind 미확인: {source_kind or '빈 값'}"]
+        expected_group, expected_owner = expected
+        if workgroup and workgroup not in {expected_group, "순방"}:
+            errors.append(f"{source_kind} 작업조는 {expected_group} 또는 근거 있는 순방이어야 함")
+        if owner and owner != expected_owner:
+            errors.append(f"{source_kind} 초벌 담당은 {expected_owner}이어야 함")
+        return errors
+
+    if source_type == "japan":
+        if workgroup and workgroup != "일본문화원":
+            errors.append("일본동향 유입의 작업조는 일본문화원이어야 함")
+        if owner:
+            if actual_edit_source_kind:
+                expected = WORKFILE_ROLE_LABELS.get(actual_edit_source_kind)
+                if expected is None:
+                    errors.append(f"일본동향 실제 편집 source_kind 미확인: {actual_edit_source_kind}")
+                elif owner != expected[1]:
+                    errors.append(f"일본동향 초벌 담당은 실제 편집 단계 {expected[1]}이어야 함")
+            elif owner not in {value[1] for value in WORKFILE_ROLE_LABELS.values()}:
+                errors.append("일본동향 초벌 담당이 허용된 실제 편집 단계 표기가 아님")
+        return errors
+
+    if source_type:
+        errors.append(f"지원하지 않는 유입 경로: {source_type}")
+    return errors
+
+
 def profile_is_complete(
     profile: dict[str, Any] | None,
     required_fields: tuple[str, ...] = ("workgroup", "owner", "worker"),
@@ -695,9 +782,15 @@ def regular_candidates(
     if missing:
         warnings.append("정기 작업내역 필수 열 누락: " + ", ".join(missing))
     workgroup, owner, worker = profile_fields(profile)
-    profile_complete = profile_is_complete(profile, valid_schedule_refs=valid_schedule_refs, require_schedule=require_schedule)
+    semantic_errors = role_semantic_errors("regular", "", workgroup, owner)
+    profile_complete = profile_is_complete(
+        profile,
+        valid_schedule_refs=valid_schedule_refs,
+        require_schedule=require_schedule,
+    ) and not semantic_errors
     if not profile_complete:
         warnings.append("정기 작업내역 역할 근거가 실행 컨텍스트에 없거나 불완전함")
+    warnings.extend(f"정기 작업내역 역할 의미 불일치: {error}" for error in semantic_errors)
     candidates: list[Candidate] = []
     for row in rows:
         row_date = parse_date(row.get("보도일"))
@@ -760,11 +853,15 @@ def worker_candidates(
             None,
         )
         workgroup, owner, worker = profile_fields(profile)
+        source_kind = clean_text((profile or {}).get("source_kind"))
+        semantic_errors = role_semantic_errors(
+            "worker", source_kind, workgroup, owner
+        )
         profile_complete = profile_is_complete(
             profile,
             valid_schedule_refs=valid_schedule_refs,
             require_schedule=require_schedule,
-        )
+        ) and not semantic_errors
         file_info = {
             "path": resolved,
             "size": path.stat().st_size,
@@ -783,13 +880,15 @@ def worker_candidates(
         seen_hashes.add(digest)
         if not profile_complete:
             warnings.append(f"파일 역할 근거 불완전: {path.name}")
+        warnings.extend(f"파일 역할 의미 불일치: {path.name}: {error}" for error in semantic_errors)
         if comparison_stage not in {"morning", "afternoon"}:
             warnings.append(f"오전·오후 비교 단계 미확인: {path.name}")
         try:
             articles = parse_document(path)
-        except Exception as exc:  # retain the run and expose the file for review
-            warnings.append(f"작업자 파일 파싱 실패: {path.name}: {exc}")
-            continue
+        except Exception as exc:
+            raise ValueError(f"작업자 파일 파싱 실패: {path.name}: {exc}") from exc
+        if not articles:
+            raise ValueError(f"작업자 파일에서 기사 제목을 찾지 못했습니다: {path.name}")
         for article in articles:
             candidates.append(
                 Candidate(
@@ -804,7 +903,7 @@ def worker_candidates(
                     extra={
                         "comparison_stage": comparison_stage,
                         "priority": int((profile or {}).get("priority", 0)),
-                        "source_kind": clean_text((profile or {}).get("source_kind")),
+                        "source_kind": source_kind,
                         "include_unmatched": bool((profile or {}).get("include_unmatched", False)),
                         "profile_complete": profile_complete,
                         "profile_evidence": (profile or {}).get("evidence", []),
@@ -828,7 +927,13 @@ def japan_candidates(
     workgroup, owner, worker = profile_fields(profile)
     candidates: list[Candidate] = []
     warnings: list[str] = []
-    profile_complete = profile_is_complete(profile, valid_schedule_refs=valid_schedule_refs, require_schedule=require_schedule)
+    semantic_errors = role_semantic_errors("japan", "", workgroup, owner)
+    profile_complete = profile_is_complete(
+        profile,
+        valid_schedule_refs=valid_schedule_refs,
+        require_schedule=require_schedule,
+    ) and not semantic_errors
+    warnings.extend(f"일본동향 역할 의미 불일치: {error}" for error in semantic_errors)
     if path.suffix.lower() == ".json" and path.is_file():
         try:
             rows = rows_from_json(path)
@@ -855,7 +960,9 @@ def japan_candidates(
                         )
                     )
         except Exception as exc:
-            warnings.append(f"일본동향 JSON 파싱 실패: {exc}")
+            raise ValueError(f"일본동향 JSON 파싱 실패: {exc}") from exc
+        if not candidates:
+            raise ValueError("일본동향 JSON에서 기사를 찾지 못했습니다.")
         return candidates, warnings
 
     for document in iter_document_files(path):
@@ -881,9 +988,9 @@ def japan_candidates(
                     )
                 )
         except Exception as exc:
-            warnings.append(f"일본동향 파일 파싱 실패: {document.name}: {exc}")
+            raise ValueError(f"일본동향 파일 파싱 실패: {document.name}: {exc}") from exc
     if not candidates:
-        warnings.append("일본동향 입력에서 기사를 찾지 못했습니다.")
+        raise ValueError("일본동향 입력에서 기사를 찾지 못했습니다.")
     return candidates, warnings
 
 
@@ -926,20 +1033,31 @@ def enrich_special_source_roles(
 ) -> list[Candidate]:
     """Keep a special workgroup while deriving its actual edit owner/worker.
 
-    Japan-report articles retain the workflow's `일본문화원` workgroup. Their
+    Japan-report articles retain the workflow's `일본문화원` workgroup.  Their
     owner and worker can vary by article, so they are copied only from a matching,
     schedule-backed current work file in chronological stage order.
     """
     enriched: list[Candidate] = []
     for candidate in candidates:
-        if candidate.owner and candidate.worker and candidate.extra.get("profile_complete"):
+        existing_errors = role_semantic_errors(
+            "japan",
+            "",
+            candidate.workgroup,
+            candidate.owner,
+            clean_text(candidate.extra.get("actual_edit_source_kind")),
+        )
+        if (
+            candidate.owner
+            and candidate.worker
+            and candidate.extra.get("profile_complete")
+            and not existing_errors
+        ):
             enriched.append(candidate)
             continue
-
         probe = Article(
             source_file=candidate.source_file,
             order=0,
-            category=clean_text(candidate.extra.get("category")),
+            category="",
             media=candidate.media,
             date=candidate.date,
             body_title=candidate.title,
@@ -950,38 +1068,85 @@ def enrich_special_source_roles(
         selected_stage = ""
         for stage in FIXED_COMPARISON_ORDER[1:]:
             stage_candidates = [
-                item
-                for item in worker_candidates
+                item for item in worker_candidates
                 if clean_text(item.extra.get("comparison_stage")) == stage
-                and item.extra.get("profile_complete")
+                and item.extra.get("profile_complete", False)
             ]
-            ranked = ranked_origin_matches(probe, stage_candidates, matching["review_threshold"])
+            ranked = ranked_origin_matches(
+                probe,
+                stage_candidates,
+                matching["review_threshold"],
+            )
             if ranked:
                 selected_score, selected = ranked[0]
                 selected_stage = stage
                 break
-
         if selected is None:
             enriched.append(candidate)
             continue
-
         refs = list(selected.extra.get("schedule_refs", []))
+        selected_source_kind = clean_text(selected.extra.get("source_kind"))
         evidence = list(candidate.extra.get("profile_evidence", []))
         evidence.extend(selected.extra.get("profile_evidence", []))
         evidence.append(
-            "특수 유입 기사의 실제 편집 작업본 대조: "
-            f"{selected_stage} {Path(selected.source_file).name} (점수 {selected_score:.3f})"
+            f"특수 유입 기사의 실제 편집 작업본 대조: {selected_stage} "
+            f"{Path(selected.source_file).name} (점수 {selected_score:.3f})"
         )
         extra = {
             **candidate.extra,
-            "profile_complete": bool(candidate.workgroup and selected.owner and selected.worker and refs),
             "profile_evidence": list(dict.fromkeys(clean_text(item) for item in evidence if clean_text(item))),
             "schedule_refs": refs,
             "actual_edit_stage": selected_stage,
             "actual_edit_file": selected.source_file,
+            "actual_edit_source_kind": selected_source_kind,
         }
+        semantic_errors = role_semantic_errors(
+            "japan",
+            "",
+            candidate.workgroup,
+            selected.owner,
+            selected_source_kind,
+        )
+        extra["profile_complete"] = bool(
+            candidate.workgroup and selected.owner and selected.worker and refs and not semantic_errors
+        )
+        extra["role_semantic_errors"] = semantic_errors
         enriched.append(replace(candidate, owner=selected.owner, worker=selected.worker, extra=extra))
     return enriched
+
+
+def plausible_reference_conflicts(
+    article: Article,
+    pools: dict[str, list[Candidate]],
+    review_threshold: float,
+) -> list[tuple[float, Candidate]]:
+    """Find earlier-source candidates hidden by a large title rewrite.
+
+    This never changes the origin automatically.  It creates a review gate when
+    a later work file is an exact match but an earlier source has the same current
+    media/date evidence and a non-trivial title relationship below the automatic
+    matching threshold.
+    """
+    same_media_date: list[tuple[float, float, Candidate]] = []
+    for source_type in REFERENCE_SOURCE_ORDER:
+        for candidate in pools.get(source_type, []):
+            score = candidate_score(article, candidate)
+            if score >= review_threshold:
+                continue
+            title_score = max(text_similarity(title, candidate.title) for title in article.match_titles)
+            same_date = bool(
+                article.date
+                and candidate.date
+                and normalize_key(article.date) == normalize_key(candidate.date)
+            )
+            same_media = media_similarity(article.media, candidate.media) >= 0.85
+            if same_date and same_media:
+                same_media_date.append((score, title_score, candidate))
+    conflicts: list[tuple[float, Candidate]] = []
+    for score, title_score, candidate in same_media_date:
+        if len(same_media_date) == 1 or title_score >= 0.2:
+            conflicts.append((score, candidate))
+    return sorted(conflicts, key=lambda pair: pair[0], reverse=True)
 
 
 def choose_origin(
@@ -1050,6 +1215,19 @@ def choose_origin(
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
         reasons.append("유입 파일의 작업자·역할 근거 불완전")
+    if chosen_stage != "reference":
+        reference_conflicts = plausible_reference_conflicts(
+            article,
+            pools,
+            matching["review_threshold"],
+        )
+        if reference_conflicts:
+            conflict_score, conflict = reference_conflicts[0]
+            reasons.append(
+                "정기·일본동향 저점수 후보 직접 대조 필요: "
+                f"{conflict.source_type} {Path(conflict.source_file).name or '현재 원본'} "
+                f"(점수 {conflict_score:.3f})"
+            )
     chosen_provenance = (chosen.workgroup, chosen.owner, chosen.worker)
     chosen_priority = int(chosen.extra.get("priority", 0))
     same_stage_ranked = sorted(
@@ -1334,7 +1512,12 @@ def result_row(
     ]
 
 
-def validate_result(final_articles: list[Article], rows: list[list[Any]], omitted_count: int = 0) -> list[str]:
+def validate_result(
+    final_articles: list[Article],
+    rows: list[list[Any]],
+    omitted_count: int = 0,
+    match_details: list[dict[str, Any]] | None = None,
+) -> list[str]:
     errors: list[str] = []
     if len(final_articles) + omitted_count != len(rows):
         errors.append(
@@ -1346,6 +1529,24 @@ def validate_result(final_articles: list[Article], rows: list[list[Any]], omitte
         errors.append("제목이 빈 결과 행 존재")
     if len({article.order for article in final_articles}) != len(final_articles):
         errors.append("최종 기사 순번 중복")
+    if match_details is not None:
+        if len(match_details) != len(rows):
+            errors.append("결과 행과 유입 근거 행 수 불일치")
+        for row, detail in zip(rows, match_details):
+            if detail.get("role_confirmed_from_reference"):
+                continue
+            semantic_errors = role_semantic_errors(
+                clean_text(detail.get("origin")),
+                clean_text(detail.get("origin_source_kind")),
+                clean_text(row[2]),
+                clean_text(row[3]),
+                clean_text(detail.get("origin_actual_edit_source_kind")),
+            )
+            if semantic_errors:
+                errors.append(
+                    f"{clean_text(row[10]) or '제목 없음'} 역할 의미 불일치: "
+                    + ", ".join(semantic_errors)
+                )
     return errors
 
 
@@ -1660,12 +1861,23 @@ def main() -> int:
                 require_schedule,
             )
             if role_profile and origin:
-                origin = replace(
+                confirmed_extra = {
+                    **origin.extra,
+                    "profile_complete": True,
+                    "role_confirmed_from_reference": True,
+                }
+                confirmed_candidate = replace(
                     origin,
                     workgroup=clean_text(role_profile.get("workgroup")),
                     owner=clean_text(role_profile.get("owner")),
                     worker=clean_text(role_profile.get("worker")),
+                    extra=confirmed_extra,
                 )
+                origin = confirmed_candidate
+                reasons = [
+                    reason for reason in reasons
+                    if reason != "유입 파일의 작업자·역할 근거 불완전"
+                ]
             elif role_profile and not origin:
                 role_confirmation_reasons.append("기사별 역할 확인값을 적용할 유입 후보가 없음")
             reasons.extend(role_confirmation_reasons)
@@ -1709,6 +1921,7 @@ def main() -> int:
             "origin": origin.source_type if origin else None,
             "origin_file": origin.source_file if origin else None,
             "origin_source_kind": origin.extra.get("source_kind") if origin else None,
+            "origin_actual_edit_source_kind": origin.extra.get("actual_edit_source_kind") if origin else None,
             "origin_comparison_stage": origin.extra.get("comparison_stage") if origin else None,
             "origin_priority": int(origin.extra.get("priority", 0)) if origin else None,
             "score": round(score, 4),
@@ -1716,6 +1929,9 @@ def main() -> int:
             "reasons": reasons,
             "context_confirmation": (confirmation or {}).get("evidence", []),
             "role_confirmation": (role_confirmation or {}).get("evidence", []),
+            "role_confirmed_from_reference": bool(
+                origin and origin.extra.get("role_confirmed_from_reference")
+            ),
             "japan_match_score": round(japan_score, 4),
             "japan_confirmation": (japan_confirmation or {}).get("evidence", []),
         }
@@ -1759,6 +1975,7 @@ def main() -> int:
             "origin": candidate.source_type,
             "origin_file": candidate.source_file,
             "origin_source_kind": candidate.extra.get("source_kind"),
+            "origin_actual_edit_source_kind": candidate.extra.get("actual_edit_source_kind"),
             "origin_comparison_stage": candidate.extra.get("comparison_stage"),
             "score": 1.0,
             "best_scores": {},
@@ -1766,6 +1983,7 @@ def main() -> int:
             "confirmed_addition": record["kind"],
             "reference_file": record["reference_file"],
             "confirmation_evidence": record["evidence"],
+            "role_confirmed_from_reference": False,
             "japan_match_score": round(japan_score, 4),
         }
         return row, detail, reasons
@@ -1868,11 +2086,13 @@ def main() -> int:
             "origin": candidate.source_type,
             "origin_file": candidate.source_file,
             "origin_source_kind": candidate.extra.get("source_kind"),
+            "origin_actual_edit_source_kind": candidate.extra.get("actual_edit_source_kind"),
             "origin_comparison_stage": candidate.extra.get("comparison_stage"),
             "score": 0.0,
             "best_scores": {},
             "reasons": reasons,
             "omitted_from_final": True,
+            "role_confirmed_from_reference": False,
             "japan_match_score": round(japan_score, 4),
         }
         match_details.append(detail)
@@ -1885,7 +2105,12 @@ def main() -> int:
         if reasons:
             reviews.append({"row_number": len(rows) + 1, "row": row, **detail})
 
-    errors = validate_result(final_articles, rows, len(omitted) + len(confirmed_additions))
+    errors = validate_result(
+        final_articles,
+        rows,
+        len(omitted) + len(confirmed_additions),
+        match_details,
+    )
     if errors:
         raise ValueError("; ".join(errors))
 

@@ -87,6 +87,18 @@ def update_checkpoint(output_dir: Path, **changes: Any) -> None:
 
 def preflight(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).resolve()
+    checkpoint = load_json(output_dir / "checkpoint.json")
+    if not checkpoint.get("intermediate_saved"):
+        raise ValueError("로컬 중간 엑셀 저장·검수가 완료되지 않아 Google Sheets 동기화를 시작할 수 없습니다.")
+    try:
+        review_rows = int(checkpoint.get("review_rows", 0))
+    except (TypeError, ValueError):
+        raise ValueError("checkpoint.json의 확인 필요 행 수가 올바르지 않습니다.")
+    if review_rows:
+        raise ValueError(
+            f"확인 필요 {review_rows}행이 남아 있어 Google Sheets 동기화를 중단합니다. "
+            "현재 원문 또는 해시 검증된 기준표로 확인값을 보완하고 결과를 다시 생성하세요."
+        )
     headers, expected = load_result(args.result_json)
     existing = matrix_from_payload(load_json(args.existing_json))
     if not existing:

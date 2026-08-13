@@ -4,12 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from process_job import RESULT_HEADERS, clean_text, media_similarity, sha256_file, text_similarity
+from process_job import (
+    RESULT_HEADERS,
+    clean_text,
+    media_similarity,
+    normalize_key,
+    parse_date,
+    parse_document,
+    profile_fields,
+    rows_from_json,
+    sha256_file,
+    text_similarity,
+)
 
 
 def read_json(path: Path) -> Any:
@@ -46,12 +58,142 @@ def merge_by_order(existing: list[dict[str, Any]], generated: list[dict[str, Any
     return sorted([*kept, *generated], key=lambda item: int(item["order"]))
 
 
+def current_source_articles(context: dict[str, Any], source_json: Path) -> list[dict[str, Any]]:
+    """Collect exact current-run candidates for reference-only missing rows."""
+    job_value = clean_text((context.get("job_date") or {}).get("value"))
+    target_date = dt.date.fromisoformat(job_value) - dt.timedelta(days=1)
+    records: list[dict[str, Any]] = []
+    regular_profile = (context.get("sources") or {}).get("regular") or {}
+    regular_group, regular_owner, regular_worker = profile_fields(regular_profile)
+    for row in rows_from_json(source_json):
+        if parse_date(row.get("보도일")) != target_date:
+            continue
+        title = clean_text(row.get("제목 (한글)"))
+        if title:
+            records.append({
+                "source_type": "regular",
+                "source_file": str(source_json.resolve()),
+                "source_title": title,
+                "media": clean_text(row.get("매체명 (원어)")) or clean_text(row.get("매체명 (한글)")),
+                "date": f"{target_date.month}.{target_date.day}",
+                "category": "",
+                "workgroup": regular_group,
+                "owner": regular_owner,
+                "worker": regular_worker,
+            })
+
+    for profile in context.get("files", []):
+        path_value = clean_text(profile.get("path"))
+        if not path_value:
+            continue
+        path = Path(path_value)
+        if not path.is_file():
+            continue
+        workgroup, owner, worker = profile_fields(profile)
+        for article in parse_document(path):
+            records.append({
+                "source_type": "worker",
+                "source_file": str(path.resolve()),
+                "source_title": article.canonical_title or article.body_title,
+                "media": article.media,
+                "date": article.date,
+                "category": article.category,
+                "workgroup": workgroup,
+                "owner": owner,
+                "worker": worker,
+            })
+
+    japan_profile = (context.get("sources") or {}).get("japan") or {}
+    japan_group, japan_owner, japan_worker = profile_fields(japan_profile)
+    for item in (context.get("japan_input") or {}).get("files", []):
+        path_value = clean_text(item.get("path"))
+        if not path_value or not Path(path_value).is_file():
+            continue
+        path = Path(path_value)
+        for article in parse_document(path):
+            records.append({
+                "source_type": "japan",
+                "source_file": str(path.resolve()),
+                "source_title": article.canonical_title or article.body_title,
+                "media": article.media,
+                "date": article.date,
+                "category": article.category,
+                "workgroup": japan_group,
+                "owner": japan_owner,
+                "worker": japan_worker,
+            })
+    return records
+
+
+def missing_reference_additions(
+    references: list[list[Any]],
+    unused: set[int],
+    matched_orders: list[tuple[int, int]],
+    candidates: list[dict[str, Any]],
+    reference_file: Path,
+    reference_hash: str,
+) -> tuple[list[dict[str, Any]], set[int]]:
+    additions: list[dict[str, Any]] = []
+    consumed: set[int] = set()
+    for reference_index in sorted(unused):
+        reference = references[reference_index]
+        included = clean_text(reference[11])
+        similar = clean_text(reference[12])
+        kind = "similar" if included == "X" and similar == "O" else "omitted" if included == "X" and similar == "X" else ""
+        if not kind:
+            continue
+        title_key = normalize_key(reference[10])
+        exact = [item for item in candidates if normalize_key(item.get("source_title")) == title_key]
+        if len(exact) > 1:
+            role_matches = [
+                item for item in exact
+                if clean_text(item.get("workgroup")) == clean_text(reference[2])
+                and clean_text(item.get("owner")) == clean_text(reference[3])
+                and clean_text(item.get("worker")) == clean_text(reference[4])
+            ]
+            exact = role_matches or exact
+        if len(exact) > 1:
+            media_matches = [
+                item for item in exact
+                if media_similarity(clean_text(item.get("media")), clean_text(reference[8])) >= 0.68
+            ]
+            exact = media_matches or exact
+        if len(exact) != 1:
+            continue
+        candidate = exact[0]
+        after_order = None
+        if kind == "similar":
+            prior = [order for matched_index, order in matched_orders if matched_index < reference_index]
+            if not prior:
+                continue
+            after_order = prior[-1]
+        additions.append({
+            "kind": kind,
+            "after_order": after_order,
+            "source_type": candidate["source_type"],
+            "source_file": candidate["source_file"],
+            "source_title": candidate["source_title"],
+            "category": clean_text(reference[7]) or clean_text(candidate.get("category")),
+            "media": clean_text(reference[8]) or clean_text(candidate.get("media")),
+            "date": clean_text(reference[9]) or clean_text(candidate.get("date")),
+            "canonical_title": clean_text(reference[10]),
+            "reference_file": str(reference_file),
+            "reference_sha256": reference_hash,
+            "evidence": [
+                f"같은 작업일 권위 기준표 {reference_index + 2}행의 누락 기사와 현재 원본 제목을 정확히 대조"
+            ],
+        })
+        consumed.add(reference_index)
+    return additions, consumed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="권위 있는 같은 작업일 기준표 피드백을 실행 컨텍스트에 반영")
     parser.add_argument("--run-context", required=True)
     parser.add_argument("--result-json", required=True)
     parser.add_argument("--reference-json", required=True)
     parser.add_argument("--reference-file", required=True)
+    parser.add_argument("--source-json", required=True)
     parser.add_argument("--schedule-json", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--audit-output", required=True)
@@ -61,8 +203,9 @@ def main() -> int:
     result_path = Path(args.result_json).resolve()
     reference_json_path = Path(args.reference_json).resolve()
     reference_file = Path(args.reference_file).resolve()
+    source_json = Path(args.source_json).resolve()
     schedule_path = Path(args.schedule_json).resolve()
-    for path in (context_path, result_path, reference_json_path, reference_file, schedule_path):
+    for path in (context_path, result_path, reference_json_path, reference_file, source_json, schedule_path):
         if not path.is_file():
             raise FileNotFoundError(path)
 
@@ -87,7 +230,19 @@ def main() -> int:
     disposition_votes: list[tuple[str, int]] = []
 
     for row, detail in zip(result.get("rows", []), result.get("matches", [])):
-        if detail.get("omitted_from_final") or detail.get("confirmed_addition"):
+        if detail.get("omitted_from_final"):
+            continue
+        if detail.get("confirmed_addition"):
+            reference_index, score = best_reference_index(row, references, unused)
+            if reference_index is not None:
+                unused.remove(reference_index)
+                matches.append({
+                    "order": detail.get("order"),
+                    "result_title": clean_text(row[10]),
+                    "reference_row": reference_index + 2,
+                    "reference_title": clean_text(references[reference_index][10]),
+                    "score": round(score, 4),
+                })
             continue
         order = detail.get("order")
         if not isinstance(order, int):
@@ -177,6 +332,26 @@ def main() -> int:
             "evidence": ["같은 작업일 권위 기준표의 기사 행 순서를 현재 최종 기사와 제목·매체로 대조"],
         }
 
+    additions, consumed_additions = missing_reference_additions(
+        references,
+        unused,
+        matched_orders,
+        current_source_articles(context, source_json),
+        reference_file,
+        reference_hash,
+    )
+    unused -= consumed_additions
+    existing_additions = [
+        item for item in context.get("article_additions", [])
+        if not (
+            clean_text(item.get("reference_file")) == str(reference_file)
+            and normalize_key(item.get("canonical_title")) in {
+                normalize_key(generated.get("canonical_title")) for generated in additions
+            }
+        )
+    ]
+    context["article_additions"] = [*existing_additions, *additions]
+
     def winning_profile(votes: list[tuple[str, str, str, str, int]]) -> tuple[str, str, str, str, int] | None:
         if not votes:
             return None
@@ -196,16 +371,10 @@ def main() -> int:
             "evidence": [f"같은 작업일 권위 기준표 {reference_row}행과 현재 유입 원본을 대조"],
             "schedule_refs": [schedule_ref],
         }
-        if source_type in {"regular", "japan"}:
+        if source_type == "regular":
             current = (context.get("sources") or {}).get(source_type) or {}
             current.update(profile)
             context.setdefault("sources", {})[source_type] = current
-        elif source_type == "worker" and source_file:
-            expected_path = Path(source_file).resolve()
-            for current in context.get("files", []):
-                if current.get("path") and Path(current["path"]).resolve() == expected_path:
-                    current.update(profile)
-                    break
     if final_votes:
         final_key = Counter(item[:3] for item in final_votes).most_common(1)[0][0]
         final_owner, final_worker, final_ref, reference_row = next(
@@ -245,9 +414,10 @@ def main() -> int:
         "role_confirmations": len(role_confirmations),
         "origin_confirmations": len(origin_confirmations),
         "article_overrides": len(overrides),
+        "article_additions": len(additions),
     }
     audit_output.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"output": str(output), **{key: audit[key] for key in ("role_confirmations", "origin_confirmations", "article_overrides")}, "unmatched": len(unused)}, ensure_ascii=False))
+    print(json.dumps({"output": str(output), **{key: audit[key] for key in ("role_confirmations", "origin_confirmations", "article_overrides", "article_additions")}, "unmatched": len(unused)}, ensure_ascii=False))
     return 0
 
 

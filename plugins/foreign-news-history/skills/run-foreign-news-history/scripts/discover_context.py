@@ -241,6 +241,25 @@ def document_signal(
     return signal
 
 
+def raise_for_unreadable_documents(
+    signals: list[dict[str, Any]],
+    label: str,
+    require_articles: bool = True,
+) -> None:
+    """Stop before a partial context can turn a missing source into a wrong role."""
+    failures: list[str] = []
+    for signal in signals:
+        filename = clean_text(signal.get("filename")) or clean_text(signal.get("path"))
+        read_error = clean_text(signal.get("read_error"))
+        if read_error:
+            failures.append(f"{filename}: {read_error}")
+            continue
+        if require_articles and int(signal.get("article_heading_count") or 0) <= 0:
+            failures.append(f"{filename}: 기사 제목 0건")
+    if failures:
+        raise ValueError(f"{label} 파싱 실패: " + "; ".join(failures))
+
+
 def main() -> int:
     args = parse_args()
     morning = Path(args.morning_dir).resolve()
@@ -276,25 +295,28 @@ def main() -> int:
         raise ValueError("동향 스케줄 근거의 작업일이 최종보고서 작업일과 다릅니다.")
     if not schedule.get("assignments"):
         raise ValueError("동향 스케줄 근거에 작업일 담당자 행이 없습니다.")
-    try:
-        final_articles = [
-            {
-                "order": article.order,
-                "category": article.category,
-                "media": article.media,
-                "date": article.date,
-                "title": article.canonical_title or article.body_title,
-                "similar": article.similar,
-            }
-            for article in parse_document(final_report)
-        ]
-    except Exception:
-        final_articles = []
     files = [
         document_signal(path, morning, "morning", schedule)
         if path.is_relative_to(morning)
         else document_signal(path, afternoon, "afternoon", schedule)
         for path in work_files
+    ]
+    final_report_signal = document_signal(final_report, final_report.parent)
+    japan_signals = [document_signal(path, japan.parent) for path in japan_files]
+    raise_for_unreadable_documents([final_report_signal], "최종보고서")
+    raise_for_unreadable_documents(files, "작업자 파일")
+    if japan_files:
+        raise_for_unreadable_documents(japan_signals, "일본언론동향")
+    final_articles = [
+        {
+            "order": article.order,
+            "category": article.category,
+            "media": article.media,
+            "date": article.date,
+            "title": article.canonical_title or article.body_title,
+            "similar": article.similar,
+        }
+        for article in parse_document(final_report)
     ]
     regular_profile = aggregate_profile(
         files,
@@ -344,11 +366,11 @@ def main() -> int:
             },
         },
         "comparison_order": ["regular_and_japan", "afternoon", "morning"],
-        "final_report_signal": document_signal(final_report, final_report.parent),
+        "final_report_signal": final_report_signal,
         "japan_input": {
             "status": "present_checked",
             "path": str(japan),
-            "files": [document_signal(path, japan.parent) for path in japan_files],
+            "files": japan_signals,
         },
         "final_articles": final_articles,
         "files": files,
