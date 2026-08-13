@@ -39,7 +39,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def document_signal(path: Path, root: Path | None = None) -> dict[str, Any]:
+def document_signal(
+    path: Path,
+    root: Path | None = None,
+    comparison_stage: str = "",
+) -> dict[str, Any]:
     try:
         paragraphs = extract_paragraphs(path)
         preview = paragraphs[:20]
@@ -61,6 +65,7 @@ def document_signal(path: Path, root: Path | None = None) -> dict[str, Any]:
         "article_heading_count": article_count,
         "document_preview": preview,
         "read_error": error,
+        "comparison_stage": comparison_stage,
         "source_kind": "",
         "workgroup": "",
         "owner": "",
@@ -171,11 +176,7 @@ def main() -> int:
                 "schedule_refs": [],
             },
         },
-        "origin_policy": {
-            "source_order": [],
-            "confidence": "unresolved",
-            "evidence": [],
-        },
+        "comparison_order": ["regular_and_japan", "morning", "afternoon"],
         "final_report_signal": document_signal(final_report, final_report.parent),
         "japan_input": {
             "status": "present_checked",
@@ -183,7 +184,12 @@ def main() -> int:
             "files": [document_signal(path, japan.parent) for path in japan_files],
         },
         "final_articles": final_articles,
-        "files": [document_signal(path, morning if path.is_relative_to(morning) else afternoon) for path in work_files],
+        "files": [
+            document_signal(path, morning, "morning")
+            if path.is_relative_to(morning)
+            else document_signal(path, afternoon, "afternoon")
+            for path in work_files
+        ],
         "article_overrides": [],
         "article_japan_confirmations": [],
         "decision_notes": [
@@ -191,6 +197,7 @@ def main() -> int:
             "작업조·초벌 담당·초벌 작업자·최종 담당·최종 작업자는 schedule_refs로 근무 시트의 당일 요일 행을 인용한다.",
             "이전 실행의 사람·조 매핑을 복사하지 않는다.",
             "일본언론동향 원본 수록 기사만 일일일본동향 O로 판정하며, 제목이 크게 바뀐 동일 기사는 article_japan_confirmations에 현재 원문 대조 근거를 기록한다.",
+            "최종보고서 기사 유입 경로는 정기 작업내역·일본동향, 오전폴더, 오후폴더 순서로 비교한다. 정기와 일본동향이 겹치면 정기를 선택하고 일본동향 O는 유지한다.",
             "근거가 없으면 빈 값과 unresolved를 유지한다.",
         ],
     }

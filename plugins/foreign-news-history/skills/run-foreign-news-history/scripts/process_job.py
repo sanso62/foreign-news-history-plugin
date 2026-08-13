@@ -56,6 +56,12 @@ SOURCE_HEADERS = [
     "제목 (한글)",
 ]
 
+# Human comparison workflow: reference sources first, then the morning folder,
+# then the afternoon folder.  This order is an operational rule, not an
+# execution-specific inference, so run_context priorities must never reorder it.
+FIXED_COMPARISON_ORDER = ("reference", "morning", "afternoon")
+REFERENCE_SOURCE_ORDER = ("regular", "japan")
+
 ARTICLE_HEADING = re.compile(r"^\s*(?P<star>\*)?\s*<(?P<meta>[^>]+)>\s*(?P<title>.+?)\s*$")
 DATE_IN_META = re.compile(r"(?<!\d)(?P<month>\d{1,2})\.(?P<day>\d{1,2})(?!\d)")
 # NFKC turns the compatibility jamo `ㅇ` into choseong `ᄋ`.
@@ -696,6 +702,7 @@ def regular_candidates(
                 url=clean_text(row.get("온라인 기사 URL")) or clean_text(row.get("URL (단축)")),
                 extra={
                     **row,
+                    "comparison_stage": "reference",
                     "priority": int((profile or {}).get("priority", 0)),
                     "profile_complete": profile_complete,
                     "profile_evidence": (profile or {}).get("evidence", []),
@@ -712,6 +719,7 @@ def worker_candidates(
     paths: list[Path],
     final_hash: str,
     run_context: dict[str, Any],
+    comparison_stages: dict[str, str] | None = None,
     valid_schedule_refs: dict[str, str] | set[str] | None = None,
     require_schedule: bool = False,
 ) -> tuple[list[Candidate], list[dict[str, Any]], list[str]]:
@@ -723,6 +731,7 @@ def worker_candidates(
     for path in paths:
         digest = sha256_file(path)
         resolved = str(path.resolve())
+        comparison_stage = clean_text((comparison_stages or {}).get(resolved))
         profile = next(
             (
                 item
@@ -743,6 +752,7 @@ def worker_candidates(
             "size": path.stat().st_size,
             "sha256": digest,
             "role": "final_report_duplicate" if digest == final_hash else clean_text((profile or {}).get("source_kind")) or "unresolved",
+            "comparison_stage": comparison_stage or "unresolved",
             "deduplicated": digest == final_hash or digest in seen_hashes,
             "context_resolved": profile_complete,
             "evidence": (profile or {}).get("evidence", []),
@@ -755,6 +765,8 @@ def worker_candidates(
         seen_hashes.add(digest)
         if not profile_complete:
             warnings.append(f"파일 역할 근거 불완전: {path.name}")
+        if comparison_stage not in {"morning", "afternoon"}:
+            warnings.append(f"오전·오후 비교 단계 미확인: {path.name}")
         try:
             articles = parse_document(path)
         except Exception as exc:  # retain the run and expose the file for review
@@ -772,6 +784,7 @@ def worker_candidates(
                     owner=owner,
                     worker=worker,
                     extra={
+                        "comparison_stage": comparison_stage,
                         "priority": int((profile or {}).get("priority", 0)),
                         "source_kind": clean_text((profile or {}).get("source_kind")),
                         "include_unmatched": bool((profile or {}).get("include_unmatched", False)),
@@ -815,6 +828,7 @@ def japan_candidates(
                             owner=owner,
                             worker=worker,
                             extra={
+                                "comparison_stage": "reference",
                                 "priority": int((profile or {}).get("priority", 0)),
                                 "profile_complete": profile_complete,
                                 "profile_evidence": (profile or {}).get("evidence", []),
@@ -840,6 +854,7 @@ def japan_candidates(
                         owner=owner,
                         worker=worker,
                         extra={
+                            "comparison_stage": "reference",
                             "priority": int((profile or {}).get("priority", 0)),
                             "profile_complete": profile_complete,
                             "profile_evidence": (profile or {}).get("evidence", []),
@@ -892,10 +907,16 @@ def choose_origin(
     matching: dict[str, float],
     origin_policy: dict[str, Any] | None = None,
 ) -> tuple[Candidate | None, float, list[str], dict[str, float]]:
+    # Kept in the signature so older run_context files remain readable.  The
+    # comparison order itself is fixed by the human workflow and cannot be
+    # overridden by execution-specific source_order/priority values.
+    _ = origin_policy
     reasons: list[str] = []
     best_scores: dict[str, float] = {}
     chosen: Candidate | None = None
     chosen_score = 0.0
+    chosen_stage = ""
+    chosen_ranked: list[tuple[float, Candidate]] = []
     ranked_by_source: dict[str, list[tuple[float, Candidate]]] = {}
     for source_type, candidates in pools.items():
         score_ranked = ranked_matches(article, candidates)
@@ -903,57 +924,60 @@ def choose_origin(
         ranked_by_source[source_type] = ranked
         best_scores[source_type] = round(score_ranked[0][0], 4) if score_ranked else 0.0
 
-    policy = origin_policy or {}
-    policy_evidence = [clean_text(item) for item in policy.get("evidence", []) if clean_text(item)]
-    selection = clean_text(policy.get("selection"))
-    source_order = [
-        clean_text(item)
-        for item in policy.get("source_order", [])
-        if clean_text(item) in pools
-    ]
-    if selection == "priority_then_score" and policy_evidence:
-        combined = sorted(
-            (pair for ranked in ranked_by_source.values() for pair in ranked),
-            key=lambda pair: (int(pair[1].extra.get("priority", 0)), pair[0]),
-            reverse=True,
-        )
-        if combined:
-            chosen_score, chosen = combined[0]
-    elif source_order and policy_evidence:
-        ordered_sources = source_order + [key for key in pools if key not in source_order]
-        for source_type in ordered_sources:
-            ranked = ranked_by_source[source_type]
+    workers = pools.get("worker", [])
+    workers_by_stage = {
+        stage: [candidate for candidate in workers if clean_text(candidate.extra.get("comparison_stage")) == stage]
+        for stage in FIXED_COMPARISON_ORDER[1:]
+    }
+    ranked_by_stage = {
+        stage: ranked_origin_matches(article, candidates, matching["review_threshold"])
+        for stage, candidates in workers_by_stage.items()
+    }
+    for stage, candidates in workers_by_stage.items():
+        score_ranked = ranked_matches(article, candidates)
+        best_scores[stage] = round(score_ranked[0][0], 4) if score_ranked else 0.0
+
+    # Stage 1: Google Sheets regular history and the supplied Japan report.
+    # If an article is in both, the long-standing business rule selects regular
+    # as the origin while Japan membership is still recorded separately as O.
+    for source_type in REFERENCE_SOURCE_ORDER:
+        ranked = ranked_by_source.get(source_type, [])
+        if ranked:
+            chosen_ranked = ranked
+            chosen_score, chosen = ranked[0]
+            chosen_stage = "reference"
+            break
+
+    # Stage 2 and 3 are determined from the explicit input folder, not the
+    # filename, source_kind, run_context priority, or a person's identity.
+    if chosen is None:
+        for stage in FIXED_COMPARISON_ORDER[1:]:
+            ranked = ranked_by_stage[stage]
             if ranked:
+                chosen_ranked = ranked
                 chosen_score, chosen = ranked[0]
+                chosen_stage = stage
                 break
-    else:
-        combined = sorted(
-            (pair for ranked in ranked_by_source.values() for pair in ranked),
-            key=lambda pair: (pair[0], int(pair[1].extra.get("priority", 0))),
-            reverse=True,
-        )
-        if combined:
-            chosen_score, chosen = combined[0]
-        if sum(bool(ranked) for ranked in ranked_by_source.values()) > 1:
-            reasons.append("유입 경로 우선순위의 현재 실행 근거 없음")
+
     if chosen is None:
         reasons.append("유입 경로를 확인하지 못함")
         return None, 0.0, reasons, best_scores
+    chosen.extra["comparison_stage"] = chosen_stage
     if chosen_score < matching["auto_threshold"]:
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
         reasons.append("유입 파일의 작업자·역할 근거 불완전")
     chosen_provenance = (chosen.workgroup, chosen.owner, chosen.worker)
     chosen_priority = int(chosen.extra.get("priority", 0))
-    all_ranked = sorted(
-        (pair for ranked in ranked_by_source.values() for pair in ranked),
+    same_stage_ranked = sorted(
+        chosen_ranked,
         key=lambda pair: (pair[0], int(pair[1].extra.get("priority", 0))),
         reverse=True,
     )
     alternative = next(
         (
             pair
-            for pair in all_ranked
+            for pair in same_stage_ranked
             if pair[1] is not chosen
             if (pair[1].workgroup, pair[1].owner, pair[1].worker) != chosen_provenance
             and int(pair[1].extra.get("priority", 0)) >= chosen_priority
@@ -1404,7 +1428,13 @@ def main() -> int:
             raise FileNotFoundError(f"{label} 파일이 아님: {path}")
 
     run_context = json.loads(run_context_path.read_text(encoding="utf-8-sig"))
-    work_paths = list(iter_document_files(morning_dir)) + list(iter_document_files(afternoon_dir))
+    morning_paths = list(iter_document_files(morning_dir))
+    afternoon_paths = list(iter_document_files(afternoon_dir))
+    work_paths = morning_paths + afternoon_paths
+    comparison_stages = {
+        **{str(path.resolve()): "morning" for path in morning_paths},
+        **{str(path.resolve()): "afternoon" for path in afternoon_paths},
+    }
     japan_path = resolve_japan_input(final_report, args.japan_input)
     fingerprint_paths = [final_report, source_json, schedule_json, *work_paths]
     if japan_path:
@@ -1470,6 +1500,7 @@ def main() -> int:
         work_paths,
         final_hash,
         run_context,
+        comparison_stages,
         valid_schedule_refs,
         require_schedule,
     )
@@ -1594,6 +1625,7 @@ def main() -> int:
             "origin": origin.source_type if origin else None,
             "origin_file": origin.source_file if origin else None,
             "origin_source_kind": origin.extra.get("source_kind") if origin else None,
+            "origin_comparison_stage": origin.extra.get("comparison_stage") if origin else None,
             "origin_priority": int(origin.extra.get("priority", 0)) if origin else None,
             "score": round(score, 4),
             "best_scores": best_scores,
@@ -1642,6 +1674,8 @@ def main() -> int:
             "title": row[10],
             "origin": candidate.source_type,
             "origin_file": candidate.source_file,
+            "origin_source_kind": candidate.extra.get("source_kind"),
+            "origin_comparison_stage": candidate.extra.get("comparison_stage"),
             "score": 1.0,
             "best_scores": {},
             "reasons": reasons,
@@ -1749,6 +1783,8 @@ def main() -> int:
             "title": row[10],
             "origin": candidate.source_type,
             "origin_file": candidate.source_file,
+            "origin_source_kind": candidate.extra.get("source_kind"),
+            "origin_comparison_stage": candidate.extra.get("comparison_stage"),
             "score": 0.0,
             "best_scores": {},
             "reasons": reasons,
