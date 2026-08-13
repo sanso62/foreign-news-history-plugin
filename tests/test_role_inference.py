@@ -238,6 +238,68 @@ class OriginOrderTests(unittest.TestCase):
         self.assertIs(regular, chosen)
         self.assertEqual([], reasons)
 
+    def test_unique_rewritten_regular_precedes_exact_morning_auxiliary(self):
+        article = process_job.Article(
+            "final.hwp", 1, "산업", "Example News", "4.2",
+            "Government abandons growth-first strategy - what will markets do next?",
+        )
+        regular = process_job.Candidate(
+            "regular",
+            "Government shifts from growth priority to stability approach - market choices ahead",
+            "Example News", "4.2", workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"comparison_stage": "reference", "profile_complete": True},
+        )
+        auxiliary = process_job.Candidate(
+            "worker", article.body_title, "Example News", "4.2",
+            workgroup="2조", owner="보조", worker="작업자정",
+            extra={
+                "source_kind": "morning_auxiliary", "comparison_stage": "morning",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        chosen, score, reasons, scores = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [], "worker": [auxiliary]}, self.MATCHING
+        )
+        self.assertLess(scores["regular"], self.MATCHING["review_threshold"])
+        self.assertGreaterEqual(score, self.MATCHING["review_threshold"] * (2.0 / 3.0))
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_unique_rewritten_regular_does_not_replace_direct_afternoon_draft(self):
+        article = process_job.Article(
+            "final.hwp", 1, "산업", "Example News", "4.2",
+            "Government abandons growth-first strategy - what will markets do next?",
+        )
+        regular = process_job.Candidate(
+            "regular",
+            "Government shifts from growth priority to stability approach - market choices ahead",
+            "Example News", "4.2", workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"comparison_stage": "reference", "profile_complete": True},
+        )
+        draft = process_job.Candidate(
+            "worker", article.body_title, "Example News", "4.2",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        auxiliary = process_job.Candidate(
+            "worker", article.body_title, "Example News", "4.2",
+            workgroup="2조", owner="보조", worker="작업자정",
+            extra={
+                "source_kind": "morning_auxiliary", "comparison_stage": "morning",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [], "worker": [draft, auxiliary]},
+            self.MATCHING,
+        )
+        self.assertIs(draft, chosen)
+        self.assertEqual([], reasons)
+
     def test_clear_review_threshold_draft_has_no_low_score_review(self):
         article = process_job.Article(
             "final.hwp", 1, "분류", "Bloomberg", "7.22",

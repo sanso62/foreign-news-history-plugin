@@ -1479,6 +1479,64 @@ def plausible_reference_conflicts(
     return sorted(conflicts, key=lambda pair: pair[0], reverse=True)
 
 
+def unique_rewritten_regular_before_morning_auxiliary(
+    article: Article,
+    regular_candidates: list[Candidate],
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> tuple[float, Candidate] | None:
+    """Recover a uniquely identifiable regular item before a morning auxiliary.
+
+    Morning auxiliary files are a late scratch/import stage, so an exact title in
+    one of them is not proof that the article first entered there.  A heavily
+    rewritten regular-history title can still establish the earlier inflow when
+    it is the only regular item from the same media and date and retains a
+    meaningful title relationship.  Individual afternoon drafts remain direct
+    provenance and deliberately disable this inference.
+    """
+    automatic_afternoon = ranked_origin_matches(
+        article,
+        [
+            candidate
+            for candidate in worker_candidates
+            if clean_text(candidate.extra.get("comparison_stage")) == "afternoon"
+        ],
+        matching["auto_threshold"],
+    )
+    if automatic_afternoon:
+        return None
+
+    automatic_morning_auxiliary = ranked_origin_matches(
+        article,
+        [
+            candidate
+            for candidate in worker_candidates
+            if clean_text(candidate.extra.get("source_kind")) == "morning_auxiliary"
+        ],
+        matching["auto_threshold"],
+    )
+    if not automatic_morning_auxiliary:
+        return None
+
+    same_media_date = [
+        candidate
+        for candidate in regular_candidates
+        if article.date
+        and candidate.date
+        and normalize_key(article.date) == normalize_key(candidate.date)
+        and media_similarity(article.media, candidate.media) >= 0.85
+    ]
+    if len(same_media_date) != 1:
+        return None
+
+    candidate = same_media_date[0]
+    score = candidate_score(article, candidate)
+    rewrite_threshold = matching["review_threshold"] * (2.0 / 3.0)
+    if score < rewrite_threshold:
+        return None
+    return score, candidate
+
+
 def choose_origin(
     article: Article,
     pools: dict[str, list[Candidate]],
@@ -1525,6 +1583,13 @@ def choose_origin(
         initial_drafts,
         matching["review_threshold"],
     )
+    rewritten_regular = unique_rewritten_regular_before_morning_auxiliary(
+        article,
+        pools.get("regular", []),
+        workers,
+        matching,
+    )
+    rewritten_regular_selected = False
 
     # An individual draft is direct article-level provenance.  A strong reference
     # match stays authoritative even when the same text was copied into a later
@@ -1576,6 +1641,12 @@ def choose_origin(
                 chosen_stage = "reference"
                 break
 
+    if chosen is None and rewritten_regular is not None:
+        chosen_score, chosen = rewritten_regular
+        chosen_ranked = [rewritten_regular]
+        chosen_stage = "reference"
+        rewritten_regular_selected = True
+
     # Stage 2 and 3 are determined from the explicit input folder, not the
     # filename, source_kind, run_context priority, or a person's identity.
     if chosen is None:
@@ -1599,7 +1670,11 @@ def choose_origin(
             default=0.0,
         ) >= matching["ambiguity_margin"]
     )
-    if chosen_score < matching["auto_threshold"] and not clear_initial_draft:
+    if (
+        chosen_score < matching["auto_threshold"]
+        and not clear_initial_draft
+        and not rewritten_regular_selected
+    ):
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
         reasons.append("유입 파일의 작업자·역할 근거 불완전")
