@@ -63,13 +63,14 @@ SOURCE_HEADERS = [
 # execution-specific inference, so run_context priorities must never reorder it.
 FIXED_COMPARISON_ORDER = ("reference", "afternoon", "morning")
 REFERENCE_SOURCE_ORDER = ("regular", "japan")
+INITIAL_DRAFT_SOURCE_KINDS = {"domestic_draft", "global_draft"}
 
 # These are workflow-stage labels, not person mappings.  They are intentionally
 # fixed because they define the meaning of the result columns.
 WORKFILE_ROLE_LABELS = {
     "domestic_draft": ("1조", "국내"),
     "global_draft": ("1조", "글로벌"),
-    "afternoon_aggregate": ("1조", "오후/총괄"),
+    "afternoon_aggregate": ("오후", "오후/총괄"),
     "morning_auxiliary": ("2조", "보조"),
     "morning_aggregate": ("2조", "오전/총괄"),
 }
@@ -97,6 +98,8 @@ class Article:
     similar: bool = False
     body_present: bool = False
     raw_heading: str = ""
+    front_title_applied: bool = False
+    group_representative: bool = False
 
     @property
     def match_titles(self) -> list[str]:
@@ -569,6 +572,8 @@ def apply_front_titles(articles: list[Article], entries: list[dict[str, str]]) -
                 # is the representative and therefore inherits the group title;
                 # the following body headings retain their own similar titles.
                 article.canonical_title = entry["title"]
+                article.front_title_applied = True
+                article.group_representative = True
             if position:
                 article.similar = True
             grouped_articles.add(article_index)
@@ -595,6 +600,7 @@ def apply_front_titles(articles: list[Article], entries: list[dict[str, str]]) -
         threshold = 0.58 if not article.similar else 0.88
         if score >= threshold and (not article.similar or title_score >= 0.82):
             article.canonical_title = entries[best_index]["title"]
+            article.front_title_applied = True
             if entries[best_index]["category"]:
                 article.category = entries[best_index]["category"]
             unused.remove(best_index)
@@ -976,6 +982,9 @@ def worker_candidates(
                         "priority": int((profile or {}).get("priority", 0)),
                         "source_kind": source_kind,
                         "include_unmatched": bool((profile or {}).get("include_unmatched", False)),
+                        "front_title_applied": article.front_title_applied,
+                        "group_representative": article.group_representative,
+                        "body_title": article.body_title,
                         "profile_complete": profile_complete,
                         "profile_evidence": (profile or {}).get("evidence", []),
                         "schedule_refs": (profile or {}).get("schedule_refs", []),
@@ -985,6 +994,185 @@ def worker_candidates(
                 )
             )
     return candidates, files, warnings
+
+
+def workfile_revision_rank(path: str) -> int:
+    stem = Path(path).stem
+    if "최종" in stem:
+        return 10_000
+    revisions = [int(value) for value in re.findall(r"(\d+)\s*차", stem)]
+    return max(revisions, default=0)
+
+
+def apply_latest_group_titles(
+    articles: list[Article],
+    candidates: list[Candidate],
+    review_threshold: float,
+) -> None:
+    """Recover an edited slash-group title omitted from the final front page."""
+    group_candidates = [
+        candidate for candidate in candidates
+        if candidate.extra.get("group_representative")
+        and clean_text(candidate.extra.get("source_kind")) in {"afternoon_aggregate", "morning_aggregate"}
+    ]
+    for article in articles:
+        if article.front_title_applied:
+            continue
+        matches: list[tuple[tuple[int, int, int], Candidate]] = []
+        for candidate in group_candidates:
+            if media_similarity(article.media, candidate.media) < 0.85:
+                continue
+            if article.date and candidate.date and parse_date(article.date) != parse_date(candidate.date):
+                continue
+            source_body_title = clean_text(candidate.extra.get("body_title"))
+            if not source_body_title:
+                continue
+            if max(text_similarity(title, source_body_title) for title in article.match_titles) < review_threshold:
+                continue
+            stage = clean_text(candidate.extra.get("comparison_stage"))
+            stage_rank = 2 if stage == "morning" else 1
+            key = (
+                stage_rank,
+                workfile_revision_rank(candidate.source_file),
+                int(candidate.extra.get("article_order", 0)),
+            )
+            matches.append((key, candidate))
+        if not matches:
+            continue
+        _, selected = max(matches, key=lambda item: item[0])
+        article.canonical_title = selected.title
+        article.front_title_applied = True
+        article.group_representative = True
+
+
+def align_group_child_titles(articles: list[Article]) -> None:
+    """Keep implicit group children consistent with the edited representative."""
+    representative_subject = ""
+    for article in articles:
+        if article.group_representative:
+            match = re.match(r"^([가-힣])\s*대통령\b", article.canonical_title)
+            representative_subject = match.group(1) if match else ""
+            continue
+        if not article.similar:
+            representative_subject = ""
+            continue
+        if not representative_subject or article.starred:
+            continue
+        match = re.match(r"^(?P<name>[가-힣]{2,4})\s*대통령(?P<rest>\s*[,，].*)$", article.canonical_title)
+        if match and match.group("name").startswith(representative_subject):
+            article.canonical_title = f"{representative_subject} 대통령{match.group('rest')}"
+
+
+def candidate_as_article(candidate: Candidate) -> Article:
+    return Article(
+        source_file=candidate.source_file,
+        order=int(candidate.extra.get("article_order", 0)),
+        category=clean_text(candidate.extra.get("category")),
+        media=candidate.media,
+        date=candidate.date,
+        body_title=clean_text(candidate.extra.get("body_title")) or candidate.title,
+        canonical_title=candidate.title,
+    )
+
+
+def infer_representative_draft_lineage(
+    final_articles: list[Article],
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> dict[int, Candidate]:
+    """Recover a draft lineage for a representative inserted during aggregation.
+
+    The inference is deliberately structural: the final row must introduce a
+    similar-report cluster, and the matching afternoon aggregate row must sit
+    between nearby rows that both map to the same current individual draft.
+    """
+    initial_drafts = [
+        candidate
+        for candidate in worker_candidates
+        if clean_text(candidate.extra.get("source_kind")) in INITIAL_DRAFT_SOURCE_KINDS
+    ]
+    aggregate_files: dict[str, list[Candidate]] = {}
+    for candidate in worker_candidates:
+        if clean_text(candidate.extra.get("source_kind")) != "afternoon_aggregate":
+            continue
+        aggregate_files.setdefault(candidate.source_file, []).append(candidate)
+    for candidates in aggregate_files.values():
+        candidates.sort(key=lambda item: int(item.extra.get("article_order", 0)))
+
+    def direct_draft(candidate: Candidate) -> Candidate | None:
+        ranked = ranked_origin_matches(
+            candidate_as_article(candidate),
+            initial_drafts,
+            matching["auto_threshold"],
+        )
+        return ranked[0][1] if ranked else None
+
+    inferred: dict[int, Candidate] = {}
+    for index, article in enumerate(final_articles[:-1]):
+        if not final_articles[index + 1].similar:
+            continue
+        aggregate_ranked = ranked_origin_matches(
+            article,
+            [candidate for candidates in aggregate_files.values() for candidate in candidates],
+            matching["auto_threshold"],
+        )
+        if not aggregate_ranked:
+            continue
+        aggregate_score, aggregate = aggregate_ranked[0]
+        sequence = aggregate_files[aggregate.source_file]
+        position = sequence.index(aggregate)
+
+        def nearby(step: int) -> Candidate | None:
+            for distance in range(1, 4):
+                probe_position = position + (step * distance)
+                if probe_position < 0 or probe_position >= len(sequence):
+                    break
+                lineage = direct_draft(sequence[probe_position])
+                if lineage is not None:
+                    return lineage
+            return None
+
+        before = nearby(-1)
+        after = nearby(1)
+        if before is None or after is None:
+            continue
+        before_key = (
+            clean_text(before.extra.get("source_kind")),
+            str(Path(before.source_file).resolve()),
+            before.workgroup,
+            before.owner,
+            before.worker,
+        )
+        after_key = (
+            clean_text(after.extra.get("source_kind")),
+            str(Path(after.source_file).resolve()),
+            after.workgroup,
+            after.owner,
+            after.worker,
+        )
+        if before_key != after_key:
+            continue
+        evidence = list(aggregate.extra.get("profile_evidence", []))
+        evidence.extend(before.extra.get("profile_evidence", []))
+        evidence.append(
+            "유사보도 대표행의 취합 위치가 동일 개별 초안의 직접 일치 기사 사이에 있음"
+        )
+        inferred[article.order] = replace(
+            aggregate,
+            workgroup=before.workgroup,
+            owner=before.owner,
+            worker=before.worker,
+            extra={
+                **aggregate.extra,
+                "source_kind": clean_text(before.extra.get("source_kind")),
+                "profile_complete": bool(before.extra.get("profile_complete", False)),
+                "profile_evidence": list(dict.fromkeys(evidence)),
+                "schedule_refs": list(before.extra.get("schedule_refs", [])),
+                "lineage_inferred_from_aggregate": True,
+                "lineage_score": round(aggregate_score, 4),
+            },
+        )
+    return inferred
 
 
 def japan_candidates(
@@ -1270,16 +1458,47 @@ def choose_origin(
         score_ranked = ranked_matches(article, candidates)
         best_scores[stage] = round(score_ranked[0][0], 4) if score_ranked else 0.0
 
-    # Stage 1: Google Sheets regular history and the supplied Japan report.
-    # If an article is in both, the long-standing business rule selects regular
-    # as the origin while Japan membership is still recorded separately as O.
+    initial_drafts = [
+        candidate
+        for candidate in workers
+        if clean_text(candidate.extra.get("source_kind")) in INITIAL_DRAFT_SOURCE_KINDS
+    ]
+    ranked_initial_drafts = ranked_origin_matches(
+        article,
+        initial_drafts,
+        matching["auto_threshold"],
+    )
+
+    # An individual draft is direct article-level provenance.  Prefer it over a
+    # looser regular/Japan title match only when the current draft is both an
+    # automatic match and materially stronger.  Equal or near-equal matches keep
+    # the earlier reference-source order (important when a regular item was also
+    # copied into a later draft).
+    reference_choice: tuple[float, Candidate] | None = None
     for source_type in REFERENCE_SOURCE_ORDER:
         ranked = ranked_by_source.get(source_type, [])
         if ranked:
-            chosen_ranked = ranked
-            chosen_score, chosen = ranked[0]
-            chosen_stage = "reference"
+            reference_choice = ranked[0]
             break
+    if ranked_initial_drafts:
+        initial_score, initial_candidate = ranked_initial_drafts[0]
+        reference_score = reference_choice[0] if reference_choice else 0.0
+        if reference_choice and initial_score - reference_score >= matching["ambiguity_margin"]:
+            chosen_ranked = ranked_initial_drafts
+            chosen_score, chosen = initial_score, initial_candidate
+            chosen_stage = clean_text(initial_candidate.extra.get("comparison_stage")) or "afternoon"
+
+    # Stage 1: Google Sheets regular history and the supplied Japan report.
+    # If an article is in both, the long-standing business rule selects regular
+    # as the origin while Japan membership is still recorded separately as O.
+    if chosen is None:
+        for source_type in REFERENCE_SOURCE_ORDER:
+            ranked = ranked_by_source.get(source_type, [])
+            if ranked:
+                chosen_ranked = ranked
+                chosen_score, chosen = ranked[0]
+                chosen_stage = "reference"
+                break
 
     # Stage 2 and 3 are determined from the explicit input folder, not the
     # filename, source_kind, run_context priority, or a person's identity.
@@ -1300,7 +1519,10 @@ def choose_origin(
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
         reasons.append("유입 파일의 작업자·역할 근거 불완전")
-    if chosen_stage != "reference":
+    if (
+        chosen_stage != "reference"
+        and clean_text(chosen.extra.get("source_kind")) not in INITIAL_DRAFT_SOURCE_KINDS
+    ):
         reference_conflicts = plausible_reference_conflicts(
             article,
             pools,
@@ -1497,6 +1719,23 @@ def confirmed_japan_candidate(
     if len(selected) != 1:
         return None, ["일본동향 기사 확인값에 해당하는 현재 원본 기사를 하나로 특정하지 못함"]
     return selected[0], []
+
+
+def confirmed_japan_origin(
+    origin: Candidate | None,
+    article: Article,
+    candidates: list[Candidate],
+    confirmation: dict[str, Any] | None,
+) -> tuple[Candidate | None, float, list[str]]:
+    """Prefer a directly confirmed Japan original over a guessed regular rewrite."""
+    if not confirmation or confirmation.get("included") is not True:
+        return origin, 0.0, []
+    confirmed, reasons = confirmed_japan_candidate(candidates, confirmation)
+    if confirmed is None:
+        return origin, 0.0, reasons
+    if origin is not None and origin.source_type != "regular":
+        return origin, 0.0, reasons
+    return confirmed, candidate_score(article, confirmed), reasons
 
 
 def confirmed_japan_exclusion(
@@ -1916,6 +2155,12 @@ def main() -> int:
         require_schedule,
     )
     warnings.extend(worker_warnings)
+    apply_latest_group_titles(
+        final_articles,
+        workers,
+        config["matching"]["review_threshold"],
+    )
+    align_group_child_titles(final_articles)
     japan, japan_warnings = japan_candidates(
         japan_path,
         source_profiles.get("japan"),
@@ -1946,6 +2191,11 @@ def main() -> int:
         warnings.append("일본언론동향 원본의 현재 실행 확인 근거가 불완전함")
 
     pools = {"regular": regular, "japan": japan, "worker": workers}
+    representative_draft_lineage = infer_representative_draft_lineage(
+        final_articles,
+        workers,
+        config["matching"],
+    )
     confirmed_additions, addition_warnings = confirmed_article_additions(run_context, pools)
     warnings.extend(addition_warnings)
     rows: list[list[Any]] = []
@@ -1958,6 +2208,11 @@ def main() -> int:
             config["matching"],
             run_context.get("origin_policy"),
         )
+        lineage_origin = representative_draft_lineage.get(article.order)
+        if lineage_origin is not None and origin is not None and origin.source_type == "regular":
+            origin = lineage_origin
+            score = candidate_score(article, lineage_origin)
+            reasons = [reason for reason in reasons if not reason.startswith("낮은 매칭 점수")]
         confirmation = next(
             (
                 item
@@ -2023,6 +2278,21 @@ def main() -> int:
             japan_confirmation,
         )
         reasons.extend(japan_reasons)
+        prior_origin = origin
+        preferred_origin, preferred_score, preferred_reasons = confirmed_japan_origin(
+            origin,
+            article,
+            japan,
+            japan_confirmation,
+        )
+        reasons.extend(preferred_reasons)
+        if preferred_origin is not origin:
+            origin = preferred_origin
+            score = preferred_score
+            if prior_origin is None:
+                reasons = [reason for reason in reasons if reason != "유입 경로를 확인하지 못함"]
+            if not origin.extra.get("profile_complete", False):
+                reasons.append("유입 파일의 작업자·역할 근거 불완전")
         japan_value = "O" if japan_match else ""
         if not article.category:
             reasons.append("최종보고서 상위 카테고리 미확인")

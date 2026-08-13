@@ -72,7 +72,7 @@ class FileRoleInferenceTests(unittest.TestCase):
 
     def test_afternoon_aggregate(self):
         profile = self.assert_profile(
-            "260803 작업자병 취합.hwp", "afternoon", "1조", "오후/총괄", "작업자병", "afternoon_aggregate"
+            "260803 작업자병 취합.hwp", "afternoon", "오후", "오후/총괄", "작업자병", "afternoon_aggregate"
         )
         self.assertFalse(profile["include_unmatched"])
 
@@ -111,6 +111,8 @@ class FileRoleInferenceTests(unittest.TestCase):
 
 
 class OriginOrderTests(unittest.TestCase):
+    MATCHING = {"review_threshold": 0.68, "auto_threshold": 0.82, "ambiguity_margin": 0.035}
+
     def test_afternoon_precedes_morning(self):
         self.assertEqual(("reference", "afternoon", "morning"), process_job.FIXED_COMPARISON_ORDER)
         article = process_job.Article(
@@ -191,6 +193,141 @@ class OriginOrderTests(unittest.TestCase):
         )
         self.assertEqual("편집된 묶음 제목", articles[0].canonical_title)
         self.assertTrue(articles[1].similar)
+
+    def test_materially_stronger_individual_draft_beats_looser_regular_match(self):
+        article = process_job.Article(
+            "final.hwp", 1, "분류", "현재 매체", "8.10",
+            "현재 최종 기사 제목", "현재 최종 기사 제목",
+        )
+        regular = process_job.Candidate(
+            "regular", "현재 기사 제목", "현재 매체", "8.10",
+            extra={"profile_complete": True},
+        )
+        draft = process_job.Candidate(
+            "worker", "현재 최종 기사 제목", "현재 매체", "",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [], "worker": [draft]}, self.MATCHING
+        )
+        self.assertIs(draft, chosen)
+        self.assertEqual([], reasons)
+
+    def test_near_equal_individual_draft_keeps_regular_origin(self):
+        article = process_job.Article(
+            "final.hwp", 1, "분류", "현재 매체", "8.10", "동일 기사", "동일 기사"
+        )
+        regular = process_job.Candidate(
+            "regular", "동일 기사", "현재 매체", "8.10",
+            extra={"profile_complete": True},
+        )
+        draft = process_job.Candidate(
+            "worker", "동일 기사", "현재 매체", "",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [], "worker": [draft]}, self.MATCHING
+        )
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_direct_japan_confirmation_overrides_regular_rewrite(self):
+        article = process_job.Article(
+            "final.hwp", 1, "분류", "교도통신", "7.23",
+            "북한 핵개발 대응 공조 강화", "북한 핵개발 대응 공조 강화",
+        )
+        regular = process_job.Candidate("regular", article.canonical_title, "교도통신", "7.23")
+        japan = process_job.Candidate(
+            "japan", "중국 미사일 우려 및 대북 연대 공유", "교도통신", "7.23",
+            source_file="japan.hwp",
+        )
+        chosen, score, reasons = process_job.confirmed_japan_origin(
+            regular, article, [japan], {
+                "included": True, "source_file": "japan.hwp", "source_title": japan.title,
+                "evidence": ["현재 일본 원문과 최종 본문 직접 대조"],
+            }
+        )
+        self.assertIs(japan, chosen)
+        self.assertGreater(score, 0)
+        self.assertEqual([], reasons)
+
+    def test_latest_group_title_and_implicit_child_subject_are_preserved(self):
+        representative = process_job.Article(
+            "final.hwp", 1, "분류", "대표 매체", "7.22",
+            "이 대통령, 젠슨 황과 회동", "이 대통령, 젠슨 황과 회동",
+        )
+        explicit_child = process_job.Article(
+            "final.hwp", 2, "분류", "첫 매체", "7.22",
+            "이재명 대통령, 첫 일정", "이재명 대통령, 첫 일정",
+            starred=True, similar=True,
+        )
+        implicit_child = process_job.Article(
+            "final.hwp", 3, "분류", "둘째 매체", "7.22",
+            "이재명 대통령, 둘째 일정", "이재명 대통령, 둘째 일정",
+            similar=True,
+        )
+        candidate = process_job.Candidate(
+            "worker", "이 대통령, 빅테크 수장 연쇄 회동 예정", "대표 매체", "7.22",
+            source_file="오전 2차.hwp", extra={
+                "comparison_stage": "morning", "source_kind": "morning_aggregate",
+                "group_representative": True, "body_title": representative.body_title,
+                "article_order": 1,
+            },
+        )
+        process_job.apply_latest_group_titles(
+            [representative, explicit_child, implicit_child], [candidate], 0.68
+        )
+        process_job.align_group_child_titles([representative, explicit_child, implicit_child])
+        self.assertEqual(candidate.title, representative.canonical_title)
+        self.assertEqual("이재명 대통령, 첫 일정", explicit_child.canonical_title)
+        self.assertEqual("이 대통령, 둘째 일정", implicit_child.canonical_title)
+
+    def test_similar_representative_inherits_sandwiched_draft_lineage(self):
+        representative = process_job.Article(
+            "final.hwp", 1, "정치", "대표 매체", "7.22", "대표 기사", "대표 기사"
+        )
+        similar = process_job.Article(
+            "final.hwp", 2, "정치", "유사 매체", "7.22", "유사 기사", "유사 기사",
+            starred=True, similar=True,
+        )
+        draft_common = {
+            "source_type": "worker", "source_file": "domestic.hwp",
+            "workgroup": "1조", "owner": "국내", "worker": "작업자을",
+            "extra": {
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "schedule_refs": ["근무!4"],
+            },
+        }
+        direct = [
+            process_job.Candidate(title="앞 기사", media="앞 매체", date="7.22", **draft_common),
+            process_job.Candidate(title="뒤 기사", media="뒤 매체", date="7.22", **draft_common),
+        ]
+        aggregate = [
+            process_job.Candidate(
+                "worker", title, media, "7.22", "aggregate.hwp",
+                extra={
+                    "source_kind": "afternoon_aggregate", "comparison_stage": "afternoon",
+                    "article_order": order, "body_title": title,
+                },
+            )
+            for order, title, media in (
+                (10, "앞 기사", "앞 매체"), (11, "대표 기사", "대표 매체"),
+                (12, "유사 기사", "유사 매체"), (13, "뒤 기사", "뒤 매체"),
+            )
+        ]
+        inferred = process_job.infer_representative_draft_lineage(
+            [representative, similar], [*direct, *aggregate], self.MATCHING
+        )
+        self.assertEqual(("1조", "국내", "작업자을"), (
+            inferred[1].workgroup, inferred[1].owner, inferred[1].worker
+        ))
 
 
 class DynamicScheduleTests(unittest.TestCase):

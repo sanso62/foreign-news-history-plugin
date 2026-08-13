@@ -67,9 +67,9 @@ def infer_file_profile(
             evidence.append("프롬프트 역할 기준: 오후 글로벌 이슈 작업본 → 1조/글로벌")
         elif "취합" in stem_marker:
             source_kind, workgroup, owner, include_unmatched, priority = (
-                "afternoon_aggregate", "1조", "오후/총괄", False, 10
+                "afternoon_aggregate", "오후", "오후/총괄", False, 10
             )
-            evidence.append("프롬프트 역할 기준: 오후 취합본 → 1조/오후/총괄")
+            evidence.append("프롬프트 역할 기준: 오후 취합본 → 오후/오후/총괄")
         else:
             source_kind, workgroup, owner, include_unmatched, priority = (
                 "domestic_draft", "1조", "국내", True, 100
