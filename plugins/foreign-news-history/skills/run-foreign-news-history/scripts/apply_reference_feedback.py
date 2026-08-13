@@ -49,7 +49,33 @@ def best_reference_index(row: list[Any], references: list[list[Any]], unused: se
     if not ranked:
         return None, 0.0
     score, index = max(ranked)
-    return (index, score) if score >= 0.68 else (None, score)
+    if score >= 0.68:
+        return index, score
+
+    # A final title can be completely rewritten.  In that case accept a single
+    # structural anchor only when category, outlet, date, and inclusion flags all
+    # agree.  This prevents the low title score from leaving the exact row unused.
+    row_media_key = normalize_key(row[8])
+    anchored: list[int] = []
+    for candidate_index in unused:
+        reference = references[candidate_index]
+        reference_media_key = normalize_key(reference[8])
+        same_media = bool(
+            row_media_key
+            and reference_media_key
+            and (
+                row_media_key in reference_media_key
+                or reference_media_key in row_media_key
+            )
+        )
+        same_category = normalize_key(row[7]) == normalize_key(reference[7])
+        same_date = normalize_key(row[9]) == normalize_key(reference[9])
+        same_flags = [clean_text(value) for value in row[11:13]] == [
+            clean_text(value) for value in reference[11:13]
+        ]
+        if same_media and same_category and same_date and same_flags:
+            anchored.append(candidate_index)
+    return (anchored[0], score) if len(anchored) == 1 else (None, score)
 
 
 def merge_by_order(existing: list[dict[str, Any]], generated: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -105,15 +131,24 @@ def current_source_articles(context: dict[str, Any], source_json: Path) -> list[
 
     japan_profile = (context.get("sources") or {}).get("japan") or {}
     japan_group, japan_owner, japan_worker = profile_fields(japan_profile)
-    for item in (context.get("japan_input") or {}).get("files", []):
+    japan_input = context.get("japan_input") or {}
+    japan_items = list(japan_input.get("files", []))
+    if clean_text(japan_input.get("path")):
+        japan_items.append({"path": japan_input.get("path")})
+    seen_japan_paths: set[str] = set()
+    for item in japan_items:
         path_value = clean_text(item.get("path"))
         if not path_value or not Path(path_value).is_file():
             continue
         path = Path(path_value)
+        resolved_path = str(path.resolve())
+        if resolved_path in seen_japan_paths:
+            continue
+        seen_japan_paths.add(resolved_path)
         for article in parse_document(path):
             records.append({
                 "source_type": "japan",
-                "source_file": str(path.resolve()),
+                "source_file": resolved_path,
                 "source_title": article.canonical_title or article.body_title,
                 "media": article.media,
                 "date": article.date,
@@ -123,6 +158,95 @@ def current_source_articles(context: dict[str, Any], source_json: Path) -> list[
                 "worker": japan_worker,
             })
     return records
+
+
+def reference_origin_candidate(
+    reference: list[Any],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Re-resolve provenance from the authoritative role columns and current inputs.
+
+    The first-pass result can contain the very provenance error that the reference
+    is meant to correct.  Therefore its selected origin is not reused here.  Role
+    fields narrow the live candidates first, then title/media/date identify the
+    article without a person, outlet, or country lookup table.
+    """
+    expected_group = clean_text(reference[2])
+    expected_owner = clean_text(reference[3])
+    expected_worker = clean_text(reference[4])
+    expected_media = clean_text(reference[8])
+    expected_date = clean_text(reference[9])
+    expected_title = clean_text(reference[10])
+
+    selected = list(candidates)
+    if expected_group:
+        group_matches = [
+            item for item in selected
+            if normalize_key(item.get("workgroup")) == normalize_key(expected_group)
+        ]
+        if not group_matches:
+            # Older run_context files left the special-source workgroup blank.
+            # The reference's Japan-membership flag permits only the current
+            # Japan input as a compatibility fallback; it never relabels a
+            # regular/worker candidate or overrides an existing group match.
+            group_matches = [
+                item for item in selected
+                if clean_text(reference[13]) == "O"
+                and clean_text(item.get("source_type")) == "japan"
+                and not clean_text(item.get("workgroup"))
+            ]
+        if not group_matches:
+            return None
+        selected = group_matches
+    for key, expected in (("owner", expected_owner), ("worker", expected_worker)):
+        if not expected:
+            continue
+        role_matches = [
+            item for item in selected
+            if normalize_key(item.get(key)) == normalize_key(expected)
+        ]
+        if role_matches:
+            selected = role_matches
+    if not selected:
+        return None
+
+    ranked: list[tuple[float, float, float, bool, bool, dict[str, Any]]] = []
+    for item in selected:
+        title_score = text_similarity(expected_title, clean_text(item.get("source_title")))
+        candidate_media = clean_text(item.get("media"))
+        expected_media_key = normalize_key(expected_media)
+        candidate_media_key = normalize_key(candidate_media)
+        strong_media = bool(
+            expected_media_key
+            and candidate_media_key
+            and (
+                expected_media_key in candidate_media_key
+                or candidate_media_key in expected_media_key
+            )
+        )
+        media_score = 1.0 if strong_media else media_similarity(expected_media, candidate_media)
+        same_date = bool(
+            expected_date
+            and clean_text(item.get("date"))
+            and normalize_key(expected_date) == normalize_key(item.get("date"))
+        )
+        score = 0.72 * title_score + 0.20 * media_score + 0.08 * float(same_date)
+        ranked.append((score, title_score, media_score, same_date, strong_media, item))
+    ranked.sort(key=lambda value: (value[0], value[1], value[2]), reverse=True)
+    best_score, title_score, media_score, same_date, strong_media, best = ranked[0]
+
+    if title_score == 1.0:
+        return best
+    strong_media_evidence = [item for item in ranked if item[4]]
+    if len(strong_media_evidence) == 1:
+        media_anchor = strong_media_evidence[0]
+        if media_anchor[3] or media_anchor[1] >= 0.25:
+            return media_anchor[5]
+    if best_score >= 0.68 and (
+        len(ranked) == 1 or best_score - ranked[1][0] >= 0.05
+    ):
+        return best
+    return None
 
 
 def missing_reference_additions(
@@ -219,9 +343,11 @@ def main() -> int:
         if clean_text(item.get("worker")) and clean_text(item.get("ref"))
     }
     reference_hash = sha256_file(reference_file)
+    source_articles = current_source_articles(context, source_json)
     unused = set(range(len(references)))
     role_confirmations: list[dict[str, Any]] = []
     origin_confirmations: list[dict[str, Any]] = []
+    japan_confirmations: list[dict[str, Any]] = []
     overrides: list[dict[str, Any]] = []
     matches: list[dict[str, Any]] = []
     matched_orders: list[tuple[int, int]] = []
@@ -255,6 +381,37 @@ def main() -> int:
         worker = clean_text(reference[4])
         schedule_ref = worker_refs.get(worker)
         evidence = [f"같은 작업일 권위 기준표 {reference_index + 2}행과 현재 결과·원본을 대조"]
+        resolved_origin = reference_origin_candidate(reference, source_articles)
+        expected_japan = clean_text(reference[13]) == "O"
+        japan_candidate = None
+        if expected_japan:
+            japan_reference = list(reference)
+            japan_reference[2:5] = ["", "", ""]
+            japan_candidate = reference_origin_candidate(
+                japan_reference,
+                [
+                    item for item in source_articles
+                    if clean_text(item.get("source_type")) == "japan"
+                ],
+            )
+        japan_confirmation = {
+            "order": order,
+            "included": expected_japan,
+            "reference_file": str(reference_file),
+            "reference_sha256": reference_hash,
+            "evidence": [
+                f"같은 작업일 권위 기준표 {reference_index + 2}행의 일일일본동향 열과 현재 일본동향 원본을 대조"
+            ],
+        }
+        if japan_candidate:
+            japan_confirmation.update(
+                {
+                    "source_file": clean_text(japan_candidate.get("source_file")),
+                    "source_title": clean_text(japan_candidate.get("source_title")),
+                }
+            )
+        if not expected_japan or japan_candidate:
+            japan_confirmations.append(japan_confirmation)
         if schedule_ref:
             role_confirmations.append(
                 {
@@ -268,9 +425,13 @@ def main() -> int:
                     "evidence": evidence,
                 }
             )
-            profile_votes[(clean_text(detail.get("origin")), clean_text(detail.get("origin_file")))].append(
-                (clean_text(reference[2]), clean_text(reference[3]), worker, schedule_ref, reference_index + 2)
-            )
+            if resolved_origin:
+                profile_votes[(
+                    clean_text(resolved_origin.get("source_type")),
+                    clean_text(resolved_origin.get("source_file")),
+                )].append(
+                    (clean_text(reference[2]), clean_text(reference[3]), worker, schedule_ref, reference_index + 2)
+                )
         if clean_text(reference[11]) == "O":
             final_worker = clean_text(reference[6])
             final_ref = worker_refs.get(final_worker)
@@ -278,14 +439,17 @@ def main() -> int:
                 final_votes.append((clean_text(reference[5]), final_worker, final_ref, reference_index + 2))
         elif clean_text(reference[5]):
             disposition_votes.append((clean_text(reference[5]), reference_index + 2))
-        if clean_text(detail.get("origin")) and clean_text(detail.get("origin_file")):
+        if resolved_origin:
             origin_confirmations.append(
                 {
                     "order": order,
-                    "source_type": clean_text(detail.get("origin")),
-                    "source_file": clean_text(detail.get("origin_file")),
-                    "source_title": clean_text(row[10]),
-                    "evidence": evidence,
+                    "source_type": clean_text(resolved_origin.get("source_type")),
+                    "source_file": clean_text(resolved_origin.get("source_file")),
+                    "source_title": clean_text(resolved_origin.get("source_title")),
+                    "evidence": [
+                        *evidence,
+                        "권위 기준표의 작업조·초벌 담당·초벌 작업자와 현재 입력 후보를 다시 대조",
+                    ],
                 }
             )
         for field_name, column in (("category", 7), ("media", 8), ("date", 9), ("canonical_title", 10)):
@@ -318,6 +482,10 @@ def main() -> int:
         context.get("article_origin_confirmations", []),
         origin_confirmations,
     )
+    context["article_japan_confirmations"] = merge_by_order(
+        context.get("article_japan_confirmations", []),
+        japan_confirmations,
+    )
     replaced_override_keys = {(item["order"], item["field"]) for item in overrides}
     context["article_overrides"] = [
         item
@@ -336,7 +504,7 @@ def main() -> int:
         references,
         unused,
         matched_orders,
-        current_source_articles(context, source_json),
+        source_articles,
         reference_file,
         reference_hash,
     )
@@ -413,11 +581,12 @@ def main() -> int:
         ],
         "role_confirmations": len(role_confirmations),
         "origin_confirmations": len(origin_confirmations),
+        "japan_confirmations": len(japan_confirmations),
         "article_overrides": len(overrides),
         "article_additions": len(additions),
     }
     audit_output.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"output": str(output), **{key: audit[key] for key in ("role_confirmations", "origin_confirmations", "article_overrides", "article_additions")}, "unmatched": len(unused)}, ensure_ascii=False))
+    print(json.dumps({"output": str(output), **{key: audit[key] for key in ("role_confirmations", "origin_confirmations", "japan_confirmations", "article_overrides", "article_additions")}, "unmatched": len(unused)}, ensure_ascii=False))
     return 0
 
 

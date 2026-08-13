@@ -35,6 +35,126 @@ sheet_sync_guard = load_module("safety_sheet_sync_guard", "sheet_sync_guard.py")
 
 
 class SafetyGuardTests(unittest.TestCase):
+    def test_output_cleanup_handles_compact_prefix_and_unbalanced_quote(self):
+        self.assertEqual(process_job.display_media("중 가상매체"), "가상매체")
+        self.assertEqual(process_job.display_media("New Example News"), "New Example News")
+        self.assertEqual(
+            process_job.display_title("장관, 노력 “전적으로 이해“"),
+            "장관, 노력 “전적으로 이해”",
+        )
+
+    def test_reference_feedback_matches_unique_anchor_after_full_title_rewrite(self):
+        row = [
+            "", "8월 4일", "2조", "보조", "작업자갑", "", "",
+            "현재 분류", "Example Finance", "8.3", "원문과 크게 다른 제목",
+            "O", "X", "", "",
+        ]
+        references = [[
+            "", "8월 4일", "2조", "보조", "작업자갑", "", "",
+            "현재 분류", "Example Finance", "8.3", "완전히 새로 쓴 최종 제목",
+            "O", "X", "", "",
+        ], [
+            "", "8월 4일", "1조", "국내", "작업자을", "", "",
+            "다른 분류", "Other News", "8.3", "다른 기사",
+            "O", "X", "", "",
+        ]]
+        index, _ = reference_feedback.best_reference_index(row, references, {0, 1})
+        self.assertEqual(index, 0)
+
+    def test_reference_feedback_re_resolves_origin_from_authoritative_roles(self):
+        reference = [
+            "", "8월 4일", "1조", "국내", "작업자을", "", "",
+            "경제", "현재 매체", "8.3", "현재 기사 제목", "O", "X", "", "",
+        ]
+        candidates = [
+            {
+                "source_type": "regular",
+                "source_file": "regular.json",
+                "source_title": "현재 기사 제목",
+                "media": "현재 매체",
+                "date": "8.3",
+                "workgroup": "정기",
+                "owner": "오후/총괄",
+                "worker": "작업자병",
+            },
+            {
+                "source_type": "worker",
+                "source_file": "domestic.hwpx",
+                "source_title": "현재 기사 제목",
+                "media": "현재 매체",
+                "date": "8.3",
+                "workgroup": "1조",
+                "owner": "국내",
+                "worker": "작업자을",
+            },
+        ]
+        selected = reference_feedback.reference_origin_candidate(reference, candidates)
+        self.assertEqual(selected["source_file"], "domestic.hwpx")
+
+    def test_reference_feedback_accepts_unique_media_after_title_and_date_edit(self):
+        reference = [
+            "", "8월 4일", "특수 경로", "오전/총괄", "작업자갑", "", "",
+            "외교", "Current Wire", "8.3", "Leaders announce expanded cooperation", "O", "X", "O", "",
+        ]
+        candidates = [
+            {
+                "source_type": "japan",
+                "source_file": "special.hwpx",
+                "source_title": "Leaders discuss cooperation framework",
+                "media": "Current Wire",
+                "date": "8.4",
+                "workgroup": "특수 경로",
+                "owner": "",
+                "worker": "",
+            },
+            {
+                "source_type": "japan",
+                "source_file": "special.hwpx",
+                "source_title": "별개의 기사",
+                "media": "Other Broadcast",
+                "date": "8.3",
+                "workgroup": "특수 경로",
+                "owner": "",
+                "worker": "",
+            },
+        ]
+        selected = reference_feedback.reference_origin_candidate(reference, candidates)
+        self.assertEqual(selected["source_title"], "Leaders discuss cooperation framework")
+
+    def test_hashed_authoritative_japan_exclusion_overrides_automatic_match(self):
+        article = process_job.Article(
+            source_file="final.hwpx",
+            order=1,
+            category="외교",
+            media="현재 매체",
+            date="8.3",
+            body_title="현재 기사 제목",
+            canonical_title="현재 기사 제목",
+        )
+        japan = process_job.Candidate(
+            source_type="japan",
+            title="현재 기사 제목",
+            media="현재 매체",
+            date="8.3",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference = Path(temp_dir) / "reference.xlsx"
+            reference.write_bytes(b"current-reference")
+            matched, score, reasons = process_job.japan_membership(
+                article,
+                [japan],
+                0.68,
+                {
+                    "included": False,
+                    "reference_file": str(reference),
+                    "reference_sha256": process_job.sha256_file(reference),
+                    "evidence": ["같은 작업일 기준표의 일본동향 열 확인"],
+                },
+            )
+        self.assertFalse(matched)
+        self.assertGreaterEqual(score, 0.68)
+        self.assertEqual(reasons, [])
+
     def test_hwp_reader_falls_back_to_bundled_module(self):
         with mock.patch.object(
             process_job.importlib, "import_module", side_effect=ImportError("not installed")

@@ -313,7 +313,10 @@ def display_media(value: str) -> str:
         separator
         and remainder
         and not re.search(r"[A-Za-z0-9]", first)
-        and re.search(r"[A-Za-z]", remainder)
+        # A multi-character prefix is only unambiguous when the actual outlet
+        # contains Latin text.  A one-character CJK/Hangul token is the compact
+        # country/source notation also used before non-Latin outlet names.
+        and (re.search(r"[A-Za-z]", remainder) or len(first) == 1)
     ):
         return remainder
     return media
@@ -323,7 +326,26 @@ def display_title(value: str) -> str:
     """Apply only presentation cleanup confirmed by the authoritative result format."""
     title = clean_text(value)
     title = re.sub(r"^\[영상\]\s*", "", title)
-    return re.sub(r"…\s+", "…", title)
+    title = re.sub(r"…\s+", "…", title)
+
+    # HWPX paragraphs sometimes encode a closing curly quote as another opening
+    # quote.  Balance only an already-open pair; do not rewrite standalone marks.
+    opened = False
+    balanced: list[str] = []
+    for character in title:
+        if character == "“":
+            if opened:
+                balanced.append("”")
+                opened = False
+            else:
+                balanced.append(character)
+                opened = True
+        elif character == "”":
+            balanced.append(character)
+            opened = False
+        else:
+            balanced.append(character)
+    return "".join(balanced)
 
 
 def strip_author_suffix(title: str) -> str:
@@ -1414,6 +1436,25 @@ def confirmed_japan_candidate(
     return selected[0], []
 
 
+def confirmed_japan_exclusion(
+    confirmation: dict[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    """Validate a same-run authoritative confirmation that Japan membership is blank."""
+    if not confirmation or confirmation.get("included") is not False:
+        return False, []
+    evidence = [clean_text(item) for item in confirmation.get("evidence", []) if clean_text(item)]
+    reference_file = clean_text(confirmation.get("reference_file"))
+    reference_sha256 = clean_text(confirmation.get("reference_sha256"))
+    if not evidence or not reference_file or not reference_sha256:
+        return False, ["일본동향 제외 확인값의 기준 파일·SHA-256·근거가 불완전함"]
+    reference_path = Path(reference_file)
+    if not reference_path.is_file():
+        return False, ["일본동향 제외 확인값의 기준 파일을 찾지 못함"]
+    if sha256_file(reference_path) != reference_sha256:
+        return False, ["일본동향 제외 확인값의 기준 파일이 확인 이후 변경됨"]
+    return True, []
+
+
 def japan_membership(
     article: Article,
     candidates: list[Candidate],
@@ -1422,12 +1463,15 @@ def japan_membership(
 ) -> tuple[bool, float, list[str]]:
     ranked = ranked_matches(article, candidates)
     automatic_score = ranked[0][0] if ranked else 0.0
+    excluded, exclusion_reasons = confirmed_japan_exclusion(confirmation)
+    if excluded:
+        return False, automatic_score, []
     if automatic_score >= threshold:
-        return True, automatic_score, []
+        return True, automatic_score, exclusion_reasons
     confirmed, reasons = confirmed_japan_candidate(candidates, confirmation)
     if confirmed:
         return True, candidate_score(article, confirmed), []
-    return False, automatic_score, reasons
+    return False, automatic_score, [*exclusion_reasons, *reasons]
 
 
 def omitted_worker_candidates(
@@ -1874,10 +1918,10 @@ def main() -> int:
                     extra=confirmed_extra,
                 )
                 origin = confirmed_candidate
-                reasons = [
-                    reason for reason in reasons
-                    if reason != "유입 파일의 작업자·역할 근거 불완전"
-                ]
+                # This confirmation is bound to the current authoritative file
+                # hash.  It resolves first-pass score/ambiguity provenance notes;
+                # later category/final/Japan checks are still added independently.
+                reasons = []
             elif role_profile and not origin:
                 role_confirmation_reasons.append("기사별 역할 확인값을 적용할 유입 후보가 없음")
             reasons.extend(role_confirmation_reasons)
