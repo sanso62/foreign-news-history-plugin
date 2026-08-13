@@ -238,6 +238,31 @@ class OriginOrderTests(unittest.TestCase):
         self.assertIs(regular, chosen)
         self.assertEqual([], reasons)
 
+    def test_clear_review_threshold_draft_has_no_low_score_review(self):
+        article = process_job.Article(
+            "final.hwp", 1, "분류", "Bloomberg", "7.22",
+            "코스피, 레버리지 청산 마무리 단계에 급반등",
+            "코스피, 레버리지 청산 마무리 단계에 급반등",
+        )
+        regular = process_job.Candidate(
+            "regular", "마진거래 청산 임박... 한국 증시 급등", "Bloomberg", "7.22",
+            extra={"profile_complete": True},
+        )
+        draft = process_job.Candidate(
+            "worker", "한국 증시, 레버리지 투자 청산 마무리 단계라는 증권사 분석에 급반등",
+            "Bloomberg", "7.22", workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        chosen, score, reasons, _ = process_job.choose_origin(
+            article, {"regular": [regular], "japan": [], "worker": [draft]}, self.MATCHING
+        )
+        self.assertIs(draft, chosen)
+        self.assertGreaterEqual(score, self.MATCHING["review_threshold"])
+        self.assertEqual([], reasons)
+
     def test_direct_japan_confirmation_overrides_regular_rewrite(self):
         article = process_job.Article(
             "final.hwp", 1, "분류", "교도통신", "7.23",

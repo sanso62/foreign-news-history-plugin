@@ -1515,7 +1515,15 @@ def choose_origin(
         reasons.append("유입 경로를 확인하지 못함")
         return None, 0.0, reasons, best_scores
     chosen.extra["comparison_stage"] = chosen_stage
-    if chosen_score < matching["auto_threshold"]:
+    clear_initial_draft = bool(
+        clean_text(chosen.extra.get("source_kind")) in INITIAL_DRAFT_SOURCE_KINDS
+        and chosen_score >= matching["review_threshold"]
+        and chosen_score - max(
+            (best_scores.get(source_type, 0.0) for source_type in REFERENCE_SOURCE_ORDER),
+            default=0.0,
+        ) >= matching["ambiguity_margin"]
+    )
+    if chosen_score < matching["auto_threshold"] and not clear_initial_draft:
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
         reasons.append("유입 파일의 작업자·역할 근거 불완전")
