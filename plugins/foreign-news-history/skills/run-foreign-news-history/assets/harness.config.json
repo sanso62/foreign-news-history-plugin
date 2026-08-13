@@ -1,0 +1,25 @@
+{
+  "spreadsheet": {
+    "url": "",
+    "id": "",
+    "source_sheet": "작업내역",
+    "source_range": "A:K",
+    "schedule_sheet": "근무",
+    "schedule_range": "A1:L100",
+    "result_sheet_pattern": "{month}월",
+    "result_range": "A:O",
+    "timezone": "Asia/Seoul"
+  },
+  "matching": {
+    "auto_threshold": 0.82,
+    "review_threshold": 0.68,
+    "ambiguity_margin": 0.035
+  },
+  "inference": {
+    "context_filename": "run_context.json",
+    "require_fresh_context": true,
+    "require_evidence": true,
+    "require_schedule_evidence_for_roles": true,
+    "unresolved_policy": "review"
+  }
+}

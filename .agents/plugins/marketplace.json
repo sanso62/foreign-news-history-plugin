@@ -1,0 +1,20 @@
+{
+  "name": "foreign-news-history",
+  "interface": {
+    "displayName": "외신동향 작업이력"
+  },
+  "plugins": [
+    {
+      "name": "foreign-news-history",
+      "source": {
+        "source": "local",
+        "path": "./plugins/foreign-news-history"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
