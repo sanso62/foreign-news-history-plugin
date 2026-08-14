@@ -6,7 +6,7 @@
 
 1. 최종보고서에서 작업일을 추출한다.
 2. 작업일 전날의 정기 작업내역을 Google Sheets에서 가져온다.
-3. `외신 일일동향`의 `근무` 탭 메타데이터와 현재 그리드를 매번 다시 읽고 `동향 스케줄` 제목 및 헤더 위치를 동적으로 확인한 뒤, 작업일의 요일 열을 선택한 스키마 버전 2 `동향스케줄.json`을 만든다. 과거 조회 범위나 셀 주소는 재사용하지 않는다.
+3. `[VT] 2026년 24시간 외신 모니터링 및 요약 보고`의 `0. 근무 일정` 탭 메타데이터와 현재 그리드를 매번 다시 읽고 `동향 스케줄` 제목 및 헤더 위치를 동적으로 확인한 뒤, 작업일의 요일 열을 선택한 스키마 버전 2 `동향스케줄.json`을 만든다. 과거 조회 범위나 셀 주소는 재사용하지 않는다.
 4. 사용자가 명시한 일본언론동향 원본 경로를 입력에 포함한다. 주변 폴더에서 경로를 추측하지 않는다.
 5. `scripts/discover_context.py`로 현재 파일명, 경로, 문서 미리보기, 기사 수, 스케줄, 일본언론동향, SHA-256과 입력 지문을 수집한다.
    - 모든 입력 문서는 `read_error`가 비어 있고 기사 제목이 1건 이상이어야 한다. 실패한 문서가 있으면 `run_context`를 만들지 않는다.
@@ -31,9 +31,9 @@
     "heading": "동향 스케줄",
     "heading_cell": "현재 표 제목 셀",
     "header_cell": "현재 보고서 헤더 셀",
-    "source": {"spreadsheet_id": "", "sheet_name": "근무", "range": "현재 실행에서 조회한 실제 A1 범위"},
+    "source": {"spreadsheet_id": "", "sheet_name": "0. 근무 일정", "range": "현재 실행에서 조회한 실제 A1 범위"},
     "assignments": [
-      {"ref": "근무!4", "sheet_row": 4, "report": "시트 원문", "report_cell": "A4", "division": "시트 원문", "division_cell": "B4", "worker": "시트 원문", "worker_cell": "G4"}
+      {"ref": "0. 근무 일정!4", "sheet_row": 4, "report": "시트 원문", "report_cell": "A4", "division": "시트 원문", "division_cell": "B4", "worker": "시트 원문", "worker_cell": "G4"}
     ],
     "sha256": "동향스케줄.json 해시"
   },
@@ -48,7 +48,7 @@
     "worker": "현재 근거로 판단한 값 또는 빈 문자열",
     "confidence": "confirmed|inferred|unresolved",
     "evidence": ["파일명, 문서, 스케줄의 구체적 근거"],
-    "schedule_refs": ["근무!행번호"]
+    "schedule_refs": ["0. 근무 일정!행번호"]
   },
   "final_disposition": {
     "not_representative_owner": "현재 업무 기준에서 확인한 표기",
@@ -73,7 +73,7 @@
       "include_unmatched": false,
       "confidence": "confirmed|inferred|unresolved",
       "evidence": ["현재 실행에서 확인한 근거"],
-      "schedule_refs": ["근무!행번호"]
+      "schedule_refs": ["0. 근무 일정!행번호"]
     }
   ],
   "article_overrides": [
@@ -88,7 +88,7 @@
       "workgroup": "현재 기준표와 당일 근거로 확인한 값",
       "owner": "현재 기준표와 당일 근거로 확인한 값",
       "worker": "현재 당일 작업자",
-      "schedule_refs": ["근무!행번호"],
+      "schedule_refs": ["0. 근무 일정!행번호"],
       "reference_file": "사용자가 현재 실행에 제공한 기준 파일 절대 경로",
       "reference_sha256": "현재 기준 파일 SHA-256",
       "evidence": ["현재 원본만으로 복원되지 않는 역할을 기준 파일 해당 행과 대조한 근거"]

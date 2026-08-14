@@ -152,6 +152,21 @@ def default_config_path() -> Path:
     return skill_root() / "assets" / "harness.config.json"
 
 
+def source_spreadsheet_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the read-only operational workbook config.
+
+    The legacy single ``spreadsheet`` block remains supported so older run
+    configs and synthetic fixtures do not break when the input and result
+    workbooks are split.
+    """
+    return config.get("source_spreadsheet") or config.get("spreadsheet") or {}
+
+
+def result_spreadsheet_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the result workbook config, with legacy fallback."""
+    return config.get("result_spreadsheet") or config.get("spreadsheet") or {}
+
+
 def clean_text(value: Any) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
@@ -694,7 +709,12 @@ def rows_from_json(path: Path) -> list[dict[str, Any]]:
     raise ValueError("정기 작업내역 JSON은 values 배열 또는 행 객체 배열이어야 합니다.")
 
 
-def source_scan_audit_errors(path: Path, target_date: dt.date) -> list[str]:
+def source_scan_audit_errors(
+    path: Path,
+    target_date: dt.date,
+    expected_spreadsheet_id: str = "",
+    expected_sheet_name: str = "",
+) -> list[str]:
     """Check that history came from a bounded formatted-value range scan."""
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict):
@@ -711,6 +731,15 @@ def source_scan_audit_errors(path: Path, target_date: dt.date) -> list[str]:
         errors.append("정기 작업내역 표시값 조회가 아님")
     if clean_text(audit.get("target_date")) != target_date.isoformat():
         errors.append("정기 작업내역 조회 대상일이 작업일 전날과 다름")
+    expected_spreadsheet_id = clean_text(expected_spreadsheet_id)
+    expected_sheet_name = clean_text(expected_sheet_name)
+    if (
+        expected_spreadsheet_id
+        and clean_text(audit.get("spreadsheet_id")) != expected_spreadsheet_id
+    ):
+        errors.append("정기 작업내역이 설정된 입력 스프레드시트에서 오지 않음")
+    if expected_sheet_name and clean_text(audit.get("sheet_name")) != expected_sheet_name:
+        errors.append("정기 작업내역이 설정된 입력 탭에서 오지 않음")
     scan_ranges = audit.get("scan_ranges")
     if not isinstance(scan_ranges, list) or not scan_ranges:
         scan_ranges = [audit.get("scan_range")]
@@ -826,7 +855,7 @@ def validate_schedule_evidence(
     except (TypeError, ValueError):
         schema_version = 0
     source = schedule.get("source") or {}
-    sheet_config = config.get("spreadsheet", {})
+    sheet_config = source_spreadsheet_config(config)
     expected_heading = clean_text(sheet_config.get("schedule_heading")) or "동향 스케줄"
     if (
         schema_version < 2
@@ -844,9 +873,16 @@ def validate_schedule_evidence(
     if clean_text(schedule.get("weekday")) != expected_weekday:
         raise ValueError("동향 스케줄 근거의 요일이 작업일과 다릅니다.")
     expected_spreadsheet = clean_text(sheet_config.get("id"))
+    expected_title = clean_text(sheet_config.get("title"))
     expected_sheet = clean_text(sheet_config.get("schedule_sheet"))
     if expected_spreadsheet and clean_text(source.get("spreadsheet_id")) != expected_spreadsheet:
-        raise ValueError("동향 스케줄 근거가 설정된 외신 일일동향 스프레드시트에서 오지 않았습니다.")
+        raise ValueError("동향 스케줄 근거가 설정된 입력 스프레드시트에서 오지 않았습니다.")
+    if (
+        expected_title
+        and clean_text(source.get("spreadsheet_title"))
+        and clean_text(source.get("spreadsheet_title")) != expected_title
+    ):
+        raise ValueError("동향 스케줄 근거의 입력 스프레드시트 제목이 설정과 다릅니다.")
     if expected_sheet and clean_text(source.get("sheet_name")) != expected_sheet:
         raise ValueError("동향 스케줄 근거의 탭이 설정된 근무 탭과 다릅니다.")
     refs = {
@@ -869,9 +905,16 @@ def regular_candidates(
     valid_schedule_refs: dict[str, str] | set[str] | None = None,
     require_schedule: bool = False,
     require_scan_audit: bool = False,
+    expected_spreadsheet_id: str = "",
+    expected_sheet_name: str = "",
 ) -> tuple[list[Candidate], list[str]]:
     if require_scan_audit:
-        audit_errors = source_scan_audit_errors(path, target_date)
+        audit_errors = source_scan_audit_errors(
+            path,
+            target_date,
+            expected_spreadsheet_id,
+            expected_sheet_name,
+        )
         if audit_errors:
             raise ValueError("; ".join(audit_errors))
     rows = rows_from_json(path)
@@ -2635,6 +2678,10 @@ def main() -> int:
     warnings.extend(order_warnings)
 
     source_profiles = run_context.get("sources", {})
+    source_sheet_config = source_spreadsheet_config(config)
+    runtime_source_id = clean_text(source_sheet_config.get("id")) or clean_text(
+        (schedule.get("source") or {}).get("spreadsheet_id")
+    )
     regular, regular_warnings = regular_candidates(
         source_json,
         target_date,
@@ -2642,6 +2689,8 @@ def main() -> int:
         valid_schedule_refs,
         require_schedule,
         bool(config.get("inference", {}).get("require_source_scan_audit", False)),
+        runtime_source_id,
+        clean_text(source_sheet_config.get("source_sheet")),
     )
     warnings.extend(regular_warnings)
     workers, worker_files, worker_warnings = worker_candidates(
@@ -3148,7 +3197,10 @@ def main() -> int:
         "matches": match_details,
     }
     review = {"headers": RESULT_HEADERS, "count": len(reviews), "items": reviews, "warnings": warnings}
-    google_payload = {"range": config["spreadsheet"]["result_range"], "values": rows}
+    google_payload = {
+        "range": clean_text(result_spreadsheet_config(config).get("result_range")) or "A:O",
+        "values": rows,
+    }
     checkpoint = {
         "job_date": job_date.isoformat(),
         "phase": "local_processed",

@@ -1,12 +1,19 @@
 {
-  "spreadsheet": {
+  "source_spreadsheet": {
     "url": "",
     "id": "",
-    "source_sheet": "작업내역",
-    "source_range": "A:K",
-    "schedule_sheet": "근무",
+    "title": "[VT] 2026년 24시간 외신 모니터링 및 요약 보고",
+    "source_sheet": "1. 작업 내역",
+    "source_range": "A:O",
+    "schedule_sheet": "0. 근무 일정",
     "schedule_heading": "동향 스케줄",
     "schedule_scan_max_cells": 50000,
+    "timezone": "Asia/Seoul"
+  },
+  "result_spreadsheet": {
+    "url": "",
+    "id": "",
+    "title": "[VT] 2026년 일일동향보고 리스트",
     "result_sheet_pattern": "{month}월",
     "result_range": "A:O",
     "timezone": "Asia/Seoul"

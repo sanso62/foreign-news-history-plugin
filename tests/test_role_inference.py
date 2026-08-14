@@ -822,6 +822,47 @@ class DynamicScheduleTests(unittest.TestCase):
         )
         self.assertEqual(refs, {"근무!3": "목 담당"})
 
+    def test_split_config_validates_schedule_against_source_workbook(self):
+        selected = select_schedule.select_schedule(
+            self.payload,
+            process_job.dt.date(2026, 7, 23),
+        )
+        refs = process_job.validate_schedule_evidence(
+            selected,
+            process_job.dt.date(2026, 7, 23),
+            {
+                "source_spreadsheet": {
+                    "id": "sheet-current",
+                    "schedule_sheet": "근무",
+                    "schedule_heading": "동향 스케줄",
+                },
+                "result_spreadsheet": {
+                    "id": "different-result-sheet",
+                    "result_range": "A:O",
+                },
+            },
+        )
+        self.assertEqual(refs, {"근무!3": "목 담당"})
+
+    def test_split_config_rejects_a_different_source_workbook_title(self):
+        selected = select_schedule.select_schedule(
+            self.payload,
+            process_job.dt.date(2026, 7, 23),
+        )
+        selected["source"]["spreadsheet_title"] = "다른 문서"
+        with self.assertRaisesRegex(ValueError, "제목"):
+            process_job.validate_schedule_evidence(
+                selected,
+                process_job.dt.date(2026, 7, 23),
+                {
+                    "source_spreadsheet": {
+                        "id": "sheet-current",
+                        "title": "입력 문서",
+                        "schedule_sheet": "근무",
+                    },
+                },
+            )
+
     def test_rejects_legacy_fixed_range_schedule(self):
         legacy = {
             "schema_version": 1,
@@ -853,12 +894,21 @@ class DynamicScheduleTests(unittest.TestCase):
 class PublicPackageSafetyTests(unittest.TestCase):
     def test_public_config_keeps_connection_values_blank(self):
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        spreadsheet = config["spreadsheet"]
-        self.assertEqual(spreadsheet["url"], "")
-        self.assertEqual(spreadsheet["id"], "")
-        self.assertNotIn("schedule_range", spreadsheet)
-        self.assertEqual(spreadsheet["schedule_heading"], "동향 스케줄")
-        self.assertLessEqual(spreadsheet["schedule_scan_max_cells"], 50000)
+        source = config["source_spreadsheet"]
+        result = config["result_spreadsheet"]
+        self.assertEqual(source["url"], "")
+        self.assertEqual(source["id"], "")
+        self.assertEqual(result["url"], "")
+        self.assertEqual(result["id"], "")
+        self.assertEqual(source["title"], "[VT] 2026년 24시간 외신 모니터링 및 요약 보고")
+        self.assertEqual(source["source_sheet"], "1. 작업 내역")
+        self.assertEqual(source["source_range"], "A:O")
+        self.assertEqual(source["schedule_sheet"], "0. 근무 일정")
+        self.assertNotIn("schedule_range", source)
+        self.assertEqual(source["schedule_heading"], "동향 스케줄")
+        self.assertLessEqual(source["schedule_scan_max_cells"], 50000)
+        self.assertEqual(result["title"], "[VT] 2026년 일일동향보고 리스트")
+        self.assertEqual(result["result_range"], "A:O")
 
 
 if __name__ == "__main__":
