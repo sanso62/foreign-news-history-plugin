@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Deterministic preflight and read-back verification for Google Sheets sync.
+"""Deterministic preflight and read-back verification for optional Sheets sync.
 
 Connector calls stay in Codex.  This script decides whether the connector may
-append, should do nothing, or must stop because existing rows conflict.
+append, should do nothing, or must stop because existing rows conflict.  The
+bundled config disables these commands during Excel-only trial operation.
 """
 
 from __future__ import annotations
@@ -24,15 +25,33 @@ def parse_args() -> argparse.Namespace:
     preflight.add_argument("--existing-json", required=True)
     preflight.add_argument("--result-json", required=True)
     preflight.add_argument("--output-dir", required=True)
+    preflight.add_argument("--config")
     verify = sub.add_parser("verify")
     verify.add_argument("--readback-json", required=True)
     verify.add_argument("--result-json", required=True)
     verify.add_argument("--output-dir", required=True)
+    verify.add_argument("--config")
     return parser.parse_args()
 
 
 def load_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def default_config_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "assets" / "harness.config.json"
+
+
+def require_google_sheets_write_enabled(args: argparse.Namespace) -> Path:
+    config_path = Path(getattr(args, "config", None) or default_config_path()).resolve()
+    config = load_json(config_path)
+    enabled = config.get("sync", {}).get("google_sheets_write_enabled") is True
+    if not enabled:
+        raise ValueError(
+            "설정에서 Google Sheets 결과 쓰기가 비활성화되어 있습니다. "
+            "현재 실행은 작업이력_최종.xlsx 생성까지만 완료해야 합니다."
+        )
+    return config_path
 
 
 def matrix_from_payload(payload: Any) -> list[list[Any]]:
@@ -86,6 +105,7 @@ def update_checkpoint(output_dir: Path, **changes: Any) -> None:
 
 
 def preflight(args: argparse.Namespace) -> int:
+    require_google_sheets_write_enabled(args)
     output_dir = Path(args.output_dir).resolve()
     checkpoint = load_json(output_dir / "checkpoint.json")
     if not checkpoint.get("intermediate_saved"):
@@ -170,6 +190,7 @@ def preflight(args: argparse.Namespace) -> int:
 
 
 def verify(args: argparse.Namespace) -> int:
+    require_google_sheets_write_enabled(args)
     output_dir = Path(args.output_dir).resolve()
     headers, expected = load_result(args.result_json)
     readback = matrix_from_payload(load_json(args.readback_json))

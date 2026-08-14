@@ -213,12 +213,18 @@ if (result.rows.some((row) => row.length !== 15)) {
 
 const qaReports = [];
 if (args.final) {
+  if (Number(review.count) !== 0 || Number(checkpoint.review_rows) !== 0) {
+    throw new Error("확인 필요 행을 모두 해소한 뒤 작업이력_최종.xlsx를 생성해야 합니다.");
+  }
   const finalWorkbook = buildIntermediateWorkbook(result, review, manifest);
   const finalName = "작업이력_최종.xlsx";
   const exported = await SpreadsheetFile.exportXlsx(finalWorkbook);
   await exported.save(path.join(outputDir, finalName));
   qaReports.push(await renderAndInspect(finalWorkbook, finalName, previewDir));
+  checkpoint.phase = "excel_finalized";
+  checkpoint.excel_finalized = true;
   checkpoint.final_backup = finalName;
+  checkpoint.final_files = [finalName];
 } else {
   const intermediateWorkbook = buildIntermediateWorkbook(result, review, manifest);
   const intermediateName = "작업이력_중간저장.xlsx";
@@ -234,6 +240,7 @@ if (args.final) {
 
   checkpoint.phase = "intermediate_saved";
   checkpoint.intermediate_saved = true;
+  checkpoint.excel_finalized = false;
   checkpoint.intermediate_files = [intermediateName, reviewName];
 }
 checkpoint.updated_at = new Date().toISOString();
@@ -245,6 +252,7 @@ process.stdout.write(
     outputDir,
     phase: checkpoint.phase,
     intermediateSaved: checkpoint.intermediate_saved,
+    excelFinalized: checkpoint.excel_finalized,
     workbooks: qaReports.map((report) => report.workbook),
     previews: qaReports.flatMap((report) => report.sheets.map((sheet) => sheet.preview)),
   }),

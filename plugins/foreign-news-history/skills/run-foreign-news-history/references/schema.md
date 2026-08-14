@@ -25,7 +25,7 @@
 
 ## 결과 열
 
-Google Sheets와 엑셀의 열 순서는 정확히 다음 `A:O`를 사용한다.
+엑셀과 선택적 Google Sheets 동기화의 열 순서는 정확히 다음 `A:O`를 사용한다.
 
 1. 상계월
 2. 작업일
@@ -50,14 +50,18 @@ Google Sheets와 엑셀의 열 순서는 정확히 다음 `A:O`를 사용한다.
 - `manifest.json`: 입력 파일, 크기, SHA-256
 - `result.json`: 헤더와 결과 행
 - `review.json`: 확인 필요 행과 사유
-- `google_payload.json`: 그대로 업로드 가능한 `A:O` 2차원 배열
-- `checkpoint.json`: `local_processed`, `intermediate_saved`, `uploaded_verified` 단계
+- `google_payload.json`: 향후 선택적 동기화에 사용할 수 있는 내부 `A:O` 2차원 배열. 기본 엑셀 전용 실행에서는 업로드하지 않는다.
+- `checkpoint.json`: `local_processed`, `intermediate_saved`, `excel_finalized` 단계와 선택적 동기화 때만 사용하는 `uploaded_verified` 상태
+- `작업이력_중간저장.xlsx`: 주요 처리 단계의 복구·검수용 엑셀
+- `확인필요_목록.xlsx`: 자동 확정하지 못한 행과 근거
+- `작업이력_최종.xlsx`: `review_rows: 0` 뒤 생성하는 기본 최종 산출물
 - `작업로그.txt`: 실행 요약과 경고
 - `run_context.json`: 현재 입력과 당일 근거만으로 작성한 작업자·역할 판단 기록
 - `동향스케줄.json`: 매 실행 입력 문서의 `0. 근무 일정` 탭 현재 그리드에서 `동향 스케줄` 제목과 헤더를 동적으로 찾은 뒤 작업일 요일 열을 선택한 보고서·구분·담당자 및 원본 행·셀 근거. 스키마 버전 2이며 입력 문서 ID, 실제 조회 범위, `heading_cell`, `header_cell`, 각 행의 `report_cell`, `division_cell`, `publication_schedule_cell`, `worker_cell`을 포함한다.
 
-`intermediate_saved` 전에는 Google Sheets에 쓰지 않는다.
-`checkpoint.json`의 `review_rows`가 0이 아니면 Google Sheets에 쓰지 않는다. 현재 원문이나 같은 작업일의 해시 검증된 기준표 확인값으로 보완한 뒤 결과와 중간 엑셀을 다시 생성한다.
+`sync.google_sheets_write_enabled`가 `false`이면 결과 Google Sheets를 조회하거나 쓰지 않는다. 이때 `작업이력_최종.xlsx` 생성과 렌더링 검수로 완료한다.
+`checkpoint.json`의 `review_rows`가 0이 아니면 `작업이력_최종.xlsx`를 만들거나 Google Sheets에 쓰지 않는다. 현재 원문이나 같은 작업일의 해시 검증된 기준표 확인값으로 보완한 뒤 결과와 중간 엑셀을 다시 생성한다.
+나중에 결과 동기화를 활성화하더라도 `intermediate_saved` 전에는 Google Sheets에 쓰지 않는다.
 
 사람·사람별 작업조·담당·카테고리·매체 별칭은 이 스키마나 전역 설정에 저장하지 않는다. 업무 프롬프트에 명시된 파일 단계별 역할 표기는 허용되는 판정 규칙이며, 현재 실행의 사람은 `references/run-context.md` 구조에 따라 파일명과 당일 근무표로 확인한다.
 

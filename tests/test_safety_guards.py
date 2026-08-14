@@ -365,6 +365,11 @@ class SafetyGuardTests(unittest.TestCase):
     def test_sheet_preflight_rejects_unresolved_review_rows(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
+            enabled_config = output_dir / "enabled-config.json"
+            enabled_config.write_text(
+                json.dumps({"sync": {"google_sheets_write_enabled": True}}),
+                encoding="utf-8",
+            )
             (output_dir / "checkpoint.json").write_text(
                 json.dumps({"intermediate_saved": True, "review_rows": 1}),
                 encoding="utf-8",
@@ -375,9 +380,22 @@ class SafetyGuardTests(unittest.TestCase):
                 existing_json=str(output_dir / "existing.json"),
                 job_date="2026-08-04",
                 sheet_name="8월",
+                config=str(enabled_config),
             )
             with self.assertRaisesRegex(ValueError, "확인 필요 1행"):
                 sheet_sync_guard.preflight(args)
+
+    def test_sheet_preflight_rejects_bundled_excel_only_config(self):
+        args = argparse.Namespace(
+            output_dir="unused",
+            result_json="unused",
+            existing_json="unused",
+            job_date="2026-08-04",
+            sheet_name="8월",
+            config=str(sheet_sync_guard.default_config_path()),
+        )
+        with self.assertRaisesRegex(ValueError, "비활성화"):
+            sheet_sync_guard.preflight(args)
 
 
 if __name__ == "__main__":

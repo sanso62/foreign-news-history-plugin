@@ -909,6 +909,11 @@ class PublicPackageSafetyTests(unittest.TestCase):
         self.assertLessEqual(source["schedule_scan_max_cells"], 50000)
         self.assertEqual(result["title"], "[VT] 2026년 일일동향보고 리스트")
         self.assertEqual(result["result_range"], "A:O")
+        self.assertIs(config["sync"]["google_sheets_write_enabled"], False)
+        self.assertFalse(process_job.google_sheets_write_enabled(config))
+        self.assertTrue(process_job.google_sheets_write_enabled({
+            "sync": {"google_sheets_write_enabled": True},
+        }))
 
 
 if __name__ == "__main__":

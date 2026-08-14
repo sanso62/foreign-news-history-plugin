@@ -167,6 +167,11 @@ def result_spreadsheet_config(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("result_spreadsheet") or config.get("spreadsheet") or {}
 
 
+def google_sheets_write_enabled(config: dict[str, Any]) -> bool:
+    """Only an explicit true value enables writes to the result spreadsheet."""
+    return config.get("sync", {}).get("google_sheets_write_enabled") is True
+
+
 def clean_text(value: Any) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
@@ -3201,10 +3206,14 @@ def main() -> int:
         "range": clean_text(result_spreadsheet_config(config).get("result_range")) or "A:O",
         "values": rows,
     }
+    sheets_write_enabled = google_sheets_write_enabled(config)
     checkpoint = {
         "job_date": job_date.isoformat(),
         "phase": "local_processed",
         "intermediate_saved": False,
+        "excel_finalized": False,
+        "google_sheets_write_enabled": sheets_write_enabled,
+        "upload_skipped": not sheets_write_enabled,
         "uploaded_verified": False,
         "result_rows": len(rows),
         "review_rows": len(reviews),
@@ -3222,6 +3231,7 @@ def main() -> int:
         f"최종 기사/결과 행: {len(final_articles)}/{len(rows)}",
         f"정기/일본/작업자 후보: {len(regular)}/{len(japan)}/{len(workers)}",
         f"확인 필요: {len(reviews)}",
+        f"Google Sheets 결과 쓰기: {'활성화' if sheets_write_enabled else '비활성화 (엑셀 전용)'}",
         *[f"경고: {warning}" for warning in warnings],
     ]
     (output_dir / "작업로그.txt").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
@@ -3234,6 +3244,7 @@ def main() -> int:
                 "result_rows": len(rows),
                 "review_rows": len(reviews),
                 "checkpoint": "local_processed",
+                "google_sheets_write_enabled": sheets_write_enabled,
             },
             ensure_ascii=False,
         )

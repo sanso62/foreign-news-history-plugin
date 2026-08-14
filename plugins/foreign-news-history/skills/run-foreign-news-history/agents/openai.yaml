@@ -1,4 +1,4 @@
 interface:
   display_name: "외신동향 작업이력"
-  short_description: "당일 근거로 작업이력을 판단하고 중간 저장 후 시트 동기화"
-  default_prompt: "Use $run-foreign-news-history to compare today's supplied foreign-news files, save the intermediate workbook, and sync only verified rows to Google Sheets."
+  short_description: "당일 근거로 작업이력을 판정하고 검수된 최종 엑셀을 저장"
+  default_prompt: "Use $run-foreign-news-history to compare today's supplied foreign-news files and create the verified final Excel workbook without writing to the result Google Sheet."

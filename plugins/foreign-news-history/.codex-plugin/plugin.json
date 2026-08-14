@@ -1,25 +1,25 @@
 {
   "name": "foreign-news-history",
-  "version": "0.1.14",
-  "description": "\uc77c\uc77c\uc678\uc2e0\ubcf4\ub3c4\ub3d9\ud5a5 \uc791\uc5c5\ubcf8\uacfc \ucd5c\uc885\ubcf4\uace0\uc11c\ub97c \ube44\uad50\ud574 \uae30\uc0ac\ubcc4 \uc791\uc5c5\uc774\ub825\uc744 \ubcf5\uc6d0\ud558\uace0 \uac80\uc99d\ub41c \uacb0\uacfc\ub97c Google Sheets\uc5d0 \ub3d9\uae30\ud654\ud569\ub2c8\ub2e4.",
+  "version": "0.1.15",
+  "description": "일일외신보도동향 작업본과 최종보고서를 비교해 기사별 작업이력을 복원하고 검증된 엑셀 결과 파일로 저장합니다.",
   "author": {
     "name": "Article Analysis"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "\uc678\uc2e0\ub3d9\ud5a5 \uc791\uc5c5\uc774\ub825 v0.1.14",
-    "shortDescription": "\uc785\ub825\u00b7\uacb0\uacfc \uc2dc\ud2b8 \ubd84\ub9ac v0.1.14 \u00b7 \uc791\uc5c5\uc774\ub825\uc744 \uac80\uc99d\ud569\ub2c8\ub2e4.",
-    "longDescription": "\uc624\uc804\u00b7\uc624\ud6c4 \uc791\uc5c5\ubcf8, \ucd5c\uc885\ubcf4\uace0\uc11c, \uc77c\ubcf8\uc5b8\ub860\ub3d9\ud5a5, \ub2f9\uc77c \uadfc\ubb34\ud45c\ub97c \ub300\uc870\ud574 \uae30\uc0ac\ubcc4 \uc720\uc785 \uacbd\ub85c\uc640 \uc791\uc5c5\uc790\ub97c \ud310\ub2e8\ud569\ub2c8\ub2e4. \uc911\uac04 \uc5d1\uc140\uc744 \uba3c\uc800 \uc800\uc7a5\ud558\uace0, \uae30\uc874 \ud589\uacfc\uc758 \ucda9\ub3cc\uc744 \ud655\uc778\ud55c \ub4a4 Google Sheets \uc6d4\ubcc4 \ud0ed\uc5d0 \uac80\uc99d\ub41c \uacb0\uacfc\ub9cc \ubc18\uc601\ud569\ub2c8\ub2e4.",
+    "displayName": "외신동향 작업이력 v0.1.15",
+    "shortDescription": "엑셀 전용 시험 운영 v0.1.15 · 작업이력을 검증합니다.",
+    "longDescription": "오전·오후 작업본, 최종보고서, 일본언론동향, 당일 근무표를 대조해 기사별 유입 경로와 작업자를 판단합니다. 중간 엑셀을 먼저 저장하고 확인 필요 행을 해소한 뒤 작업이력_최종.xlsx를 만듭니다. 결과 Google Sheets 쓰기는 시험 운영 기간에 기본 비활성화됩니다.",
     "developerName": "Article Analysis",
     "category": "Productivity",
     "capabilities": [
       "File analysis",
       "Spreadsheet creation",
-      "Google Sheets sync"
+      "Google Sheets read"
     ],
     "defaultPrompt": [
       "\uc624\ub298 \uc678\uc2e0\ub3d9\ud5a5 \uc791\uc5c5\ubcf8\uacfc \ucd5c\uc885\ubcf4\uace0\uc11c\ub97c \ube44\uad50\ud574 \uc791\uc5c5\uc774\ub825\uc744 \ub9cc\ub4e4\uc5b4\uc918.",
-      "\uc678\uc2e0\ub3d9\ud5a5 \uacb0\uacfc\ub97c \uc911\uac04 \uc5d1\uc140\ub85c \uc800\uc7a5\ud558\uace0 \uac80\uc218 \ud6c4 \uc2dc\ud2b8\uc5d0 \ubc18\uc601\ud574\uc918."
+      "결과 시트에는 쓰지 말고, 검수한 작업이력_최종.xlsx만 만들어줘."
     ]
   }
 }

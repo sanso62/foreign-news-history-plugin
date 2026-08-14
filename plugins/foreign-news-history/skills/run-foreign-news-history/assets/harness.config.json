@@ -18,6 +18,9 @@
     "result_range": "A:O",
     "timezone": "Asia/Seoul"
   },
+  "sync": {
+    "google_sheets_write_enabled": false
+  },
   "matching": {
     "auto_threshold": 0.82,
     "review_threshold": 0.68,

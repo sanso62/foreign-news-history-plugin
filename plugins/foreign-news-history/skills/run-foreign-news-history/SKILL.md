@@ -1,6 +1,6 @@
 ---
 name: run-foreign-news-history
-description: 일일외신보도동향 최종보고서와 당일 오전·오후 작업본, 정기 모니터링 및 일본동향 자료를 비교해 기사별 유입 경로·작업자·최종 반영·유사보도 여부를 판정하고 중간 엑셀을 저장한 뒤 Google Sheets에 검증 업로드한다. 사람·조·담당·카테고리·매체를 고정 매핑하지 않고 매 실행의 파일·문서·당일 스케줄 근거를 Codex가 직접 판단한다. 외신동향 작업이력, 작업본/최종본 비교, 기사 이력 엑셀 또는 시트 반영 요청에 사용한다.
+description: 일일외신보도동향 최종보고서와 당일 오전·오후 작업본, 정기 모니터링 및 일본동향 자료를 비교해 기사별 유입 경로·작업자·최종 반영·유사보도 여부를 판정하고 검수된 최종 엑셀을 만든다. 결과 Google Sheets 쓰기는 기본적으로 비활성화하며, 사람·조·담당·카테고리·매체를 고정 매핑하지 않고 매 실행의 파일·문서·당일 스케줄 근거를 Codex가 직접 판단한다. 외신동향 작업이력, 작업본/최종본 비교, 기사 이력 엑셀 요청에 사용한다.
 ---
 
 # 외신동향 작업이력 하네스
@@ -42,7 +42,7 @@ description: 일일외신보도동향 최종보고서와 당일 오전·오후 �
 
 1. 이 스킬 폴더의 `references/workflow-rules.md`와 `assets/harness.config.json`을 읽는다. `workflow-rules.md`는 업무 기준 원문이므로 사용자가 명시적으로 개정을 요청하지 않는 한 수정하지 않는다.
 2. `references/schema.md`, `references/run-context.md`, `references/google-sheets.md`를 읽는다.
-3. Google Sheets에는 `google-drive:google-sheets`, 엑셀에는 `spreadsheets:Spreadsheets` 스킬을 적용한다. 둘 중 하나가 없으면 대체 구현을 추측하지 말고 필요한 플러그인 설치를 안내한 뒤 중단한다.
+3. 입력 Google Sheets 조회에는 `google-drive:google-sheets`, 엑셀 생성에는 `spreadsheets:Spreadsheets` 스킬을 적용한다. 둘 중 하나가 없으면 대체 구현을 추측하지 말고 필요한 플러그인 설치를 안내한 뒤 중단한다. 결과 Google Sheets 쓰기가 비활성화된 동안에는 결과 문서 조회·쓰기 도구를 호출하지 않는다.
 4. 로컬 스크립트를 실행하기 전에 Codex 워크스페이스 의존성 경로를 불러온다. 모든 `.py` 파일은 반환된 Python 실행 파일로 실행한다. 모든 `.mjs` 파일은 반환된 Node.js 실행 파일로 실행하고, 반환된 Node.js packages 경로를 해당 명령의 `NODE_PATH`로 설정한다. HWP 판독 모듈은 플러그인에 포함되어 있으므로 사용자의 `olefile` 설치를 요구하지 않는다. 사용자의 Python·Node.js 설치를 가정하거나 전역 환경 변수·프로젝트 `node_modules`를 만들지 않는다.
 
 ## 실행
@@ -58,9 +58,10 @@ description: 일일외신보도동향 최종보고서와 당일 오전·오후 �
 9. 일본언론동향 원본의 모든 기사와 최종 결과를 제목·매체·날짜로 전수 비교한다. 제목 점수가 낮아도 같은 매체이고 날짜가 하루 이내인 후보는 반드시 두 원문을 직접 확인한다. 동일 기사면 `article_japan_confirmations`에 현재 실행의 원문 대조 근거를 기록해 O로 확정한다. 일본동향의 초벌 담당·작업자는 기사별 우연한 첫 매치가 아니라 일본동향 전체 묶음을 가장 완전하게 취급한 당일 작업본과 근무표로 판정한다.
 10. 최종보고서 대표·유사 기사에 실제 초벌 작업본의 완전 미포함(X/X) 기사와 오후 취합본에서 오전 취합본까지 유지된 완전 미포함 기사를 더한 수가 결과 행 수와 같은지 확인한다. 첫 장의 `/` 묶음은 첫 매체를 대표로, 뒤 매체 기사를 유사보도로 유지하되, 묶음 대표 제목은 첫 본문 기사와 의미상 대응할 때만 덮어쓴다. 최신 오전 총괄본에 명시된 유사보도가 최종 본문 추출에서 빠졌으면 같은 묶음의 대표 기사 뒤에 자동 복구한다. 최신 총괄본의 카테고리는 최종 상위 카테고리의 호환되는 확장 표기일 때만 반영한다. 유사보도 제목 줄의 날짜가 비어 있으면 매칭된 현재 원본 날짜를 사용한다. 낮은 매칭 점수나 불완전한 역할 근거는 결과에서 제거하지 않고 `확인 필요`로 분리한다. `작업조/초벌 담당` 조합이 선택된 파일의 `source_kind`와 다르면 결과 생성을 실패시킨다.
 11. 사용자가 같은 작업일의 권위 있는 정답 파일을 제공하면 `xlsx_to_json.mjs`로 읽은 뒤 `apply_reference_feedback.py`에 현재 `--source-json`도 함께 전달한다. 첫 결과의 유입 경로를 그대로 재확인하지 말고, 기준표의 작업조·초벌 담당·초벌 작업자와 현재 정기·일본·작업본 후보를 다시 대조해 역할·표기·행 순서 차이를 해시 검증된 실행별 확인값으로 만든다. 제목이 전면 수정된 행은 카테고리·매체·날짜·포함 상태가 하나의 행만 가리킬 때 대응시키고, `일일일본동향`의 O와 공란도 기준 파일 해시에 묶어 자동 오탐·누락을 교정한다. 자동 결과에 없는 유사·미포함 행은 정기 JSON·일본동향·`include_unmatched` 작업본의 정확한 현재 원본 후보와 일치할 때만 `article_additions`로 보완한다. 기준 파일 경로와 SHA-256, 현재 원본의 정확한 유입 경로·제목, 삽입 위치, 구체적 행 근거를 모두 기록하고 다른 날짜에는 재사용하지 않는다. 재실행 후 `compare_reference_result.py`의 `exact_match`를 확인한다.
-12. `scripts/build_workbooks.mjs`로 `작업이력_중간저장.xlsx`와 `확인필요_목록.xlsx`를 먼저 생성하고 모든 시트를 렌더링 검수한다. 엑셀 생성이 끝나기 전에는 Google Sheets에 쓰지 않는다.
-13. `확인 필요` 행을 현재 원문 또는 11단계의 기준표 확인값으로 모두 해소해 `review_rows: 0`인 결과를 다시 만든다. 현재 원문 확인값은 반드시 실행 컨텍스트에 기록하고 `process_job.py`를 재실행한다. 생성된 `result.json`·`google_payload.json`·엑셀·Google Sheets 셀을 손으로 서로 다르게 고치지 않는다. 특히 `article_japan_confirmations`로 일본 원문 유입이 확정된 행은 정기 후보의 원시 점수가 더 높더라도 스크립트가 선택한 `일본문화원` 유입 역할을 다시 정기로 바꾸지 않는다. 결과가 잘못됐다고 판단하면 확인값을 수정해 처음부터 재처리한다.
-14. 결과 스프레드시트 `[VT] 2026년 일일동향보고 리스트`의 월별 결과 탭을 읽어 `scripts/sheet_sync_guard.py preflight`를 실행한다. 입력 스프레드시트에는 쓰지 않는다. 이 검사는 중간 엑셀 저장 완료와 확인 필요 0건을 강제한다. `append`만 쓰고, `no_op`은 생략하며, `conflict`는 자동 덮어쓰지 않는다. 업로드 값은 `google_payload.json`에서만 가져온다. 쓴 범위를 재조회해 `scripts/sheet_sync_guard.py verify`로 `result.json`과 완전 일치를 확인한 뒤 같은 결과로 `작업이력_최종.xlsx`를 만든다.
+12. `scripts/build_workbooks.mjs`로 `작업이력_중간저장.xlsx`와 `확인필요_목록.xlsx`를 먼저 생성하고 모든 시트를 렌더링 검수한다.
+13. `확인 필요` 행을 현재 원문 또는 11단계의 기준표 확인값으로 모두 해소해 `review_rows: 0`인 결과를 다시 만든다. 현재 원문 확인값은 반드시 실행 컨텍스트에 기록하고 `process_job.py`를 재실행한다. 생성된 `result.json`·내부 동기화용 `google_payload.json`·엑셀을 손으로 서로 다르게 고치지 않는다. 특히 `article_japan_confirmations`로 일본 원문 유입이 확정된 행은 정기 후보의 원시 점수가 더 높더라도 스크립트가 선택한 `일본문화원` 유입 역할을 다시 정기로 바꾸지 않는다. 결과가 잘못됐다고 판단하면 확인값을 수정해 처음부터 재처리한다.
+14. `review_rows: 0`을 확인한 뒤 `scripts/build_workbooks.mjs --final`로 `작업이력_최종.xlsx`를 만들고 모든 시트를 렌더링 검수한다. `checkpoint.json`이 `phase: excel_finalized`, `excel_finalized: true`인지 확인하면 기본 실행을 완료한다.
+15. 기본 설정 `sync.google_sheets_write_enabled: false`에서는 결과 스프레드시트 `[VT] 2026년 일일동향보고 리스트`의 메타데이터·월별 탭·기존 행을 조회하지 않고 쓰기 도구도 호출하지 않는다. 나중에 운영 검증을 마친 뒤 설정이 명시적으로 `true`로 바뀌고 사용자가 결과 시트 반영을 요청한 실행에만 결과 월별 탭을 읽고 `scripts/sheet_sync_guard.py preflight --config <설정>`과 `scripts/sheet_sync_guard.py verify --config <설정>` 절차를 따른다. 이때도 입력 스프레드시트에는 쓰지 않으며, `append`만 쓰고 `no_op`은 생략하고 `conflict`는 자동 덮어쓰지 않는다.
 
 ## 금지
 
@@ -79,6 +80,8 @@ description: 일일외신보도동향 최종보고서와 당일 오전·오후 �
 - HWP·HWPX 파싱 실패나 기사 0건을 경고로 낮춰 나머지 파일만으로 계속 처리
 - `확인 필요` 행이 남은 결과를 Google Sheets에 업로드
 - 중간 엑셀 생성 전에 Google Sheets 쓰기
+- `sync.google_sheets_write_enabled`가 `false`인 상태에서 결과 스프레드시트 조회·쓰기 또는 `sheet_sync_guard.py` 실행
+- 사용자의 명시적 결과 시트 반영 요청 없이 설정을 `true`로 바꾸거나 Google Sheets에 쓰기
 - `process_job.py` 재실행 없이 `result.json`, 엑셀 또는 Google Sheets의 역할·분류·일본동향 값을 손으로 교정
 - 동일 작업일의 서로 다른 기존 행 자동 교체
 
