@@ -138,7 +138,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-json", required=True)
     parser.add_argument("--schedule-json", required=True, help="작업일 요일을 선택한 근무 시트 근거 JSON")
     parser.add_argument("--run-context", required=True, help="현재 실행에서 Codex가 근거와 함께 작성한 JSON")
-    parser.add_argument("--japan-input", required=True, help="현재 작업일의 일본언론동향 원본 정확한 경로")
+    parser.add_argument(
+        "--japan-input",
+        help="선택 입력. 제공하는 경우 현재 작업일의 일본언론동향 원본 정확한 경로",
+    )
     parser.add_argument("--output-dir")
     parser.add_argument("--config")
     return parser.parse_args()
@@ -1293,7 +1296,7 @@ def japan_candidates(
     require_schedule: bool = False,
 ) -> tuple[list[Candidate], list[str]]:
     if path is None:
-        return [], ["일본동향 입력 미제공: 일일일본동향 여부는 자동 확정하지 않음"]
+        return [], ["일본동향 선택 입력 미제공: 일일일본동향 열은 공란으로 유지"]
     workgroup, owner, worker = profile_fields(profile)
     candidates: list[Candidate] = []
     warnings: list[str] = []
@@ -2500,9 +2503,9 @@ def document_job_date(final_report: Path) -> tuple[dt.date | None, str]:
     return None, ""
 
 
-def resolve_japan_input(final_report: Path, explicit: str | Path | None = None) -> Path:
+def resolve_japan_input(final_report: Path, explicit: str | Path | None = None) -> Path | None:
     if not explicit:
-        raise ValueError("일본언론동향 원본의 정확한 경로를 입력해야 합니다.")
+        return None
     selected = Path(explicit).resolve()
     if not selected.is_file():
         raise FileNotFoundError(f"일본언론동향 입력 파일 없음: {selected}")
@@ -2513,6 +2516,18 @@ def resolve_japan_input(final_report: Path, explicit: str | Path | None = None) 
             f"일본언론동향 작업일 {selected_date.isoformat()}이 최종보고서 작업일 {final_date.isoformat()}과 다릅니다."
         )
     return selected
+
+
+def japan_input_is_resolved(
+    path: Path | None,
+    profile: dict[str, Any] | None,
+) -> bool:
+    """Return whether the current context explicitly records Japan input state."""
+    profile = profile or {}
+    status = clean_text(profile.get("status"))
+    has_evidence = any(clean_text(item) for item in profile.get("evidence", []))
+    expected_status = "present_checked" if path else "not_provided"
+    return status == expected_status and has_evidence
 
 
 def resolve_job_date(
@@ -2657,7 +2672,7 @@ def main() -> int:
             + (f"; {japan_date_evidence}" if japan_date_evidence else "")
         )
     else:
-        warnings.append("같은 작업일의 일본언론동향 원본을 찾지 못함")
+        warnings.append("일본언론동향 미제공(선택 입력): 일일일본동향 열은 공란으로 유지")
     schedule = json.loads(schedule_json.read_text(encoding="utf-8-sig"))
     context_schedule = run_context.get("schedule") or {}
     context_schedule_hash = clean_text(context_schedule.get("sha256"))
@@ -2742,11 +2757,12 @@ def main() -> int:
         and any(clean_text(item) for item in final_disposition.get("evidence", []))
     )
     japan_profile = source_profiles.get("japan") or {}
-    japan_status = clean_text(japan_profile.get("status"))
-    japan_status_evidence = any(clean_text(item) for item in japan_profile.get("evidence", []))
-    japan_source_confirmed = japan_status == "present_checked" and japan_status_evidence and bool(japan_path)
-    if japan_path and not japan_source_confirmed:
-        warnings.append("일본언론동향 원본의 현재 실행 확인 근거가 불완전함")
+    japan_source_resolved = japan_input_is_resolved(japan_path, japan_profile)
+    if not japan_source_resolved:
+        if japan_path:
+            warnings.append("일본언론동향 원본의 현재 실행 확인 근거가 불완전함")
+        else:
+            warnings.append("일본언론동향 미제공 상태의 현재 실행 근거가 불완전함")
 
     pools = {"regular": regular, "japan": japan, "worker": workers}
     representative_draft_lineage = infer_representative_draft_lineage(
@@ -2883,7 +2899,7 @@ def main() -> int:
             reasons.append("최종 담당·작업자 근거 불완전")
         if article.similar and not disposition_complete:
             reasons.append("비대표·미포함 최종 담당 표기 근거 불완전")
-        if not japan_value and not japan_source_confirmed:
+        if not japan_value and not japan_source_resolved:
             reasons.append("일본동향 자료 제공 여부 미확인")
         row = result_row(
             article,
@@ -2938,7 +2954,7 @@ def main() -> int:
         )
         reasons.extend(japan_reasons)
         japan_value = "O" if japan_match else ""
-        if not japan_value and not japan_source_confirmed:
+        if not japan_value and not japan_source_resolved:
             reasons.append("일본동향 자료 제공 여부 미확인")
         in_final_report = record["kind"] == "similar"
         row = result_row(
@@ -3047,7 +3063,7 @@ def main() -> int:
         )
         reasons.extend(japan_reasons)
         japan_value = "O" if japan_match else ""
-        if not japan_value and not japan_source_confirmed:
+        if not japan_value and not japan_source_resolved:
             reasons.append("일본동향 자료 제공 여부 미확인")
         article = Article(
             source_file=candidate.source_file,
@@ -3160,6 +3176,11 @@ def main() -> int:
             "job_date": schedule.get("job_date"),
             "weekday": schedule.get("weekday"),
             "assignment_refs": sorted(valid_schedule_refs),
+        },
+        "japan_input": {
+            "status": "present_checked" if japan_path else "not_provided",
+            "path": str(japan_path) if japan_path else "",
+            "candidate_articles": len(japan),
         },
         "files": [final_info, source_info, schedule_info, *([japan_info] if japan_info else []), *worker_files],
         "counts": {

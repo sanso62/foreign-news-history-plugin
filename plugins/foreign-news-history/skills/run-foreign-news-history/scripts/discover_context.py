@@ -193,7 +193,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-report", required=True)
     parser.add_argument("--source-json", required=True)
     parser.add_argument("--schedule-json", required=True, help="작업일 요일을 선택한 동향 스케줄 근거 JSON")
-    parser.add_argument("--japan-input", required=True, help="현재 작업일의 일본언론동향 원본 정확한 경로")
+    parser.add_argument(
+        "--japan-input",
+        help="선택 입력. 제공하는 경우 현재 작업일의 일본언론동향 원본 정확한 경로",
+    )
     parser.add_argument("--output", required=True)
     return parser.parse_args()
 
@@ -282,10 +285,10 @@ def main() -> int:
         raise FileNotFoundError(f"동향 스케줄 JSON 없음: {schedule_json}")
 
     work_files = list(iter_document_files(morning)) + list(iter_document_files(afternoon))
-    japan_files = list(iter_document_files(japan))
+    japan_files = list(iter_document_files(japan)) if japan else []
     all_inputs = [final_report, source_json, schedule_json, *work_files]
     all_inputs.extend(japan_files)
-    if japan.suffix.lower() == ".json":
+    if japan and japan.suffix.lower() == ".json":
         all_inputs.append(japan)
 
     job_date, job_evidence = document_job_date(final_report)
@@ -302,7 +305,7 @@ def main() -> int:
         for path in work_files
     ]
     final_report_signal = document_signal(final_report, final_report.parent)
-    japan_signals = [document_signal(path, japan.parent) for path in japan_files]
+    japan_signals = [document_signal(path, japan.parent) for path in japan_files] if japan else []
     raise_for_unreadable_documents([final_report_signal], "최종보고서")
     raise_for_unreadable_documents(files, "작업자 파일")
     if japan_files:
@@ -332,7 +335,28 @@ def main() -> int:
         "오전/총괄",
         "프롬프트 역할 기준: 최종 대표기사 → 오전/총괄, 작업자는 당일 오전 총괄 작업자",
     )
-    japan_evidence = "사용자가 명시한 같은 작업일의 일본언론동향 원본을 확인함: " + str(japan)
+    if japan:
+        japan_status = "present_checked"
+        japan_evidence = "사용자가 명시한 같은 작업일의 일본언론동향 원본을 확인함: " + str(japan)
+        japan_workgroup = "일본문화원"
+        japan_confidence = "unresolved"
+        japan_profile_evidence = [
+            japan_evidence,
+            "프롬프트 특수 유입 기준: 일본언론동향 → 작업조 일본문화원",
+        ]
+        japan_decision_note = (
+            "일본언론동향 원본 수록 기사만 일일일본동향 O로 판정하며, 제목이 크게 바뀐 "
+            "동일 기사는 article_japan_confirmations에 현재 원문 대조 근거를 기록한다."
+        )
+    else:
+        japan_status = "not_provided"
+        japan_evidence = "일본언론동향은 선택 입력이며 이번 실행에는 제공되지 않음"
+        japan_workgroup = ""
+        japan_confidence = "confirmed"
+        japan_profile_evidence = [japan_evidence]
+        japan_decision_note = (
+            "일본언론동향이 제공되지 않아 일본동향 비교를 건너뛰고 일일일본동향 열을 공란으로 유지한다."
+        )
     draft = {
         "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "input_fingerprint": run_fingerprint(all_inputs),
@@ -355,21 +379,21 @@ def main() -> int:
         "sources": {
             "regular": regular_profile,
             "japan": {
-                "status": "present_checked",
-                "workgroup": "일본문화원",
+                "status": japan_status,
+                "workgroup": japan_workgroup,
                 "owner": "",
                 "worker": "",
                 "priority": 0,
-                "confidence": "unresolved",
-                "evidence": [japan_evidence, "프롬프트 특수 유입 기준: 일본언론동향 → 작업조 일본문화원"],
+                "confidence": japan_confidence,
+                "evidence": japan_profile_evidence,
                 "schedule_refs": [],
             },
         },
         "comparison_order": ["regular_and_japan", "afternoon", "morning"],
         "final_report_signal": final_report_signal,
         "japan_input": {
-            "status": "present_checked",
-            "path": str(japan),
+            "status": japan_status,
+            "path": str(japan) if japan else "",
             "files": japan_signals,
         },
         "final_articles": final_articles,
@@ -380,7 +404,7 @@ def main() -> int:
             "프롬프트에 명시된 파일 단계별 역할 표기를 적용하고, 작업자는 현재 파일명과 당일 근무표가 일치할 때만 확정한다.",
             "작업조·초벌 담당·초벌 작업자·최종 담당·최종 작업자는 schedule_refs로 근무 시트의 당일 요일 행을 인용한다.",
             "이전 실행의 사람·조 매핑을 복사하지 않는다.",
-            "일본언론동향 원본 수록 기사만 일일일본동향 O로 판정하며, 제목이 크게 바뀐 동일 기사는 article_japan_confirmations에 현재 원문 대조 근거를 기록한다.",
+            japan_decision_note,
             "최종보고서 기사 유입 경로는 정기 작업내역·일본동향, 오후폴더, 오전폴더 순서로 비교한다. 정기와 일본동향이 겹치면 정기를 선택하고 일본동향 O는 유지한다.",
             "근거가 없으면 빈 값과 unresolved를 유지한다.",
         ],

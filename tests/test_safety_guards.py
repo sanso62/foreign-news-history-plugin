@@ -224,6 +224,111 @@ class SafetyGuardTests(unittest.TestCase):
         self.assertGreaterEqual(score, 0.68)
         self.assertEqual(reasons, [])
 
+    def test_japan_cli_argument_is_optional_for_both_stages(self):
+        common = [
+            "--morning-dir", "morning",
+            "--afternoon-dir", "afternoon",
+            "--final-report", "final.hwpx",
+            "--source-json", "source.json",
+            "--schedule-json", "schedule.json",
+        ]
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["discover_context.py", *common, "--output", "context.json"],
+        ):
+            self.assertIsNone(discover_context.parse_args().japan_input)
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["process_job.py", *common, "--run-context", "context.json"],
+        ):
+            self.assertIsNone(process_job.parse_args().japan_input)
+
+    def test_omitted_japan_path_is_optional(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_report = Path(temp_dir) / "260723(목) 일일외신보도동향.hwpx"
+            final_report.write_bytes(b"synthetic")
+            self.assertIsNone(process_job.resolve_japan_input(final_report))
+
+    def test_explicit_missing_japan_path_still_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            final_report = root / "260723(목) 일일외신보도동향.hwpx"
+            final_report.write_bytes(b"synthetic")
+            with self.assertRaisesRegex(FileNotFoundError, "입력 파일 없음"):
+                process_job.resolve_japan_input(final_report, root / "missing.hwpx")
+
+    def test_not_provided_context_resolves_optional_japan_input(self):
+        self.assertTrue(process_job.japan_input_is_resolved(
+            None,
+            {
+                "status": "not_provided",
+                "evidence": ["이번 실행에는 일본언론동향이 제공되지 않음"],
+            },
+        ))
+        self.assertFalse(process_job.japan_input_is_resolved(
+            None,
+            {"status": "present_checked", "evidence": ["과거 입력 근거"]},
+        ))
+
+    def test_missing_japan_source_keeps_membership_blank(self):
+        candidates, warnings = process_job.japan_candidates(
+            None,
+            {"status": "not_provided", "evidence": ["이번 실행 미제공"]},
+        )
+        self.assertEqual(candidates, [])
+        self.assertTrue(any("공란으로 유지" in warning for warning in warnings))
+
+    def test_context_discovery_records_omitted_japan_input(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            morning = root / "morning"
+            afternoon = root / "afternoon"
+            morning.mkdir()
+            afternoon.mkdir()
+            final_report = root / "260723(목) 일일외신보도동향.hwpx"
+            source_json = root / "source.json"
+            schedule_json = root / "schedule.json"
+            output = root / "context.json"
+            final_report.write_bytes(b"synthetic")
+            source_json.write_text("{}", encoding="utf-8")
+            schedule_json.write_text(json.dumps({
+                "job_date": "2026-07-23",
+                "assignments": [{"ref": "0. 근무 일정!1", "worker": "현재 작업자"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            final_signal = {
+                "path": str(final_report),
+                "filename": final_report.name,
+                "read_error": "",
+                "article_heading_count": 1,
+            }
+            article = process_job.Article(
+                str(final_report), 1, "현재 분류", "현재 매체", "7.22", "현재 기사", "현재 기사"
+            )
+            argv = [
+                "discover_context.py",
+                "--morning-dir", str(morning),
+                "--afternoon-dir", str(afternoon),
+                "--final-report", str(final_report),
+                "--source-json", str(source_json),
+                "--schedule-json", str(schedule_json),
+                "--output", str(output),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(discover_context, "document_signal", return_value=final_signal),
+                mock.patch.object(discover_context, "parse_document", return_value=[article]),
+            ):
+                self.assertEqual(discover_context.main(), 0)
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["japan_input"], {
+                "status": "not_provided",
+                "path": "",
+                "files": [],
+            })
+            self.assertEqual(payload["sources"]["japan"]["status"], "not_provided")
+
     def test_hwp_reader_falls_back_to_bundled_module(self):
         with mock.patch.object(
             process_job.importlib, "import_module", side_effect=ImportError("not installed")

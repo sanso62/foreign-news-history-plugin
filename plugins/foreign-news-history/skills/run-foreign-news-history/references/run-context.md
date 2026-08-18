@@ -7,9 +7,9 @@
 1. 최종보고서에서 작업일을 추출한다.
 2. 작업일 전날의 정기 작업내역을 Google Sheets에서 가져온다.
 3. `[VT] 2026년 24시간 외신 모니터링 및 요약 보고`의 `0. 근무 일정` 탭 메타데이터와 현재 그리드를 매번 다시 읽고 `동향 스케줄` 제목 및 헤더 위치를 동적으로 확인한 뒤, 작업일의 요일 열을 선택한 스키마 버전 2 `동향스케줄.json`을 만든다. 과거 조회 범위나 셀 주소는 재사용하지 않는다.
-4. 사용자가 명시한 일본언론동향 원본 경로를 입력에 포함한다. 주변 폴더에서 경로를 추측하지 않는다.
-5. `scripts/discover_context.py`로 현재 파일명, 경로, 문서 미리보기, 기사 수, 스케줄, 일본언론동향, SHA-256과 입력 지문을 수집한다.
-   - 모든 입력 문서는 `read_error`가 비어 있고 기사 제목이 1건 이상이어야 한다. 실패한 문서가 있으면 `run_context`를 만들지 않는다.
+4. 일본언론동향은 선택 입력으로 받는다. 제공된 경우에만 사용자가 명시한 원본 경로를 입력에 포함하고 주변 폴더에서 경로를 추측하지 않는다. 제공되지 않으면 `not_provided`로 기록한다.
+5. `scripts/discover_context.py`로 현재 파일명, 경로, 문서 미리보기, 기사 수, 스케줄, 선택적으로 제공된 일본언론동향, SHA-256과 입력 지문을 수집한다.
+   - 필수 입력 문서와 제공된 일본동향은 `read_error`가 비어 있고 기사 제목이 1건 이상이어야 한다. 실패한 문서가 있으면 `run_context`를 만들지 않는다.
 6. 스크립트가 프롬프트의 파일 단계별 역할표를 적용하고, Codex가 현재 파일과 작업일 동향스케줄을 함께 읽어 충돌과 예외를 검수한다.
 7. 다섯 역할 열의 판단 근거를 각 항목의 `evidence`와 `schedule_refs`에 기록한다. 근거가 없으면 값을 비우고 `confidence: unresolved`를 유지한다.
 
@@ -38,7 +38,7 @@
     "sha256": "동향스케줄.json 해시"
   },
   "japan_input": {
-    "status": "present_checked|unresolved",
+    "status": "present_checked|not_provided|unresolved",
     "path": "현재 실행에서 찾은 일본언론동향 절대 경로",
     "files": ["해시·기사 수·미리보기 신호"]
   },
@@ -57,7 +57,7 @@
   },
   "sources": {
     "regular": {"workgroup": "", "owner": "", "worker": "", "priority": 0, "confidence": "", "evidence": [], "schedule_refs": []},
-    "japan": {"status": "present_checked|unresolved", "workgroup": "", "owner": "", "worker": "", "priority": 0, "confidence": "", "evidence": [], "schedule_refs": []}
+    "japan": {"status": "present_checked|not_provided|unresolved", "workgroup": "", "owner": "", "worker": "", "priority": 0, "confidence": "", "evidence": [], "schedule_refs": []}
   },
   "comparison_order": ["regular_and_japan", "afternoon", "morning"],
   "files": [
@@ -154,7 +154,7 @@
 - `priority`는 같은 비교 단계 안에서 현재 파일들의 생성·취합 관계를 비교해 정한다. 사람 이름별 고정 숫자를 사용하지 않는다.
 - 실제 초벌 파일에서 최종보고서에 빠진 기사까지 추적해야 하는 파일만 `include_unmatched: true`로 둔다. 취합본·중간 총괄본에는 설정하지 않는다.
 - 파일 프로필의 `workgroup`·`owner`는 `source_kind`의 업무 표기와 일치해야 한다. 값과 근무표 참조가 모두 있어도 `global_draft`가 `오후/총괄`처럼 의미가 어긋나면 완전한 근거로 인정하지 않는다.
-- 일본동향은 사용자가 명시한 정확한 경로만 사용한다. 경로가 없거나 파일이 없으면 실행을 시작하지 않는다.
+- 일본동향은 선택 입력이며, 제공된 경우에만 사용자가 명시한 정확한 경로를 사용한다. 입력을 생략하면 `not_provided` 근거를 남기고 일본동향 비교 없이 계속 진행한다. 경로를 명시했는데 파일이 없으면 실행을 시작하지 않는다.
 - 일본동향의 제목이 최종보고서에서 크게 수정돼 자동 임계치를 넘지 못한 경우, 현재 원본의 정확한 제목과 원문 대조 근거가 있는 `article_japan_confirmations`만 적용한다. 같은 작업일의 권위 기준표가 있으면 O와 공란을 모두 기준 파일 경로·SHA-256에 묶어 기록하며, 공란 확인값은 자동 오탐을 억제한다. 과거 확인값은 재사용하지 않는다.
 - 같은 비교 단계 안에서 유입 후보가 경합하면 현재 자료와 업무 원칙으로 판단하고, 근거가 없으면 결과를 `확인 필요`로 남긴다. 현재 원문을 직접 대조한 실행별 `article_origin_confirmations`만 자동 선택을 교정할 수 있다.
 - 프로필의 세 필드(`workgroup`, `owner`, `worker`) 중 하나라도 근거 있게 확인되지 않으면 해당 결과 행을 `확인 필요`로 유지한다.
