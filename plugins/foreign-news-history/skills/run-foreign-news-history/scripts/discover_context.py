@@ -319,7 +319,7 @@ def main() -> int:
             "title": article.canonical_title or article.body_title,
             "similar": article.similar,
         }
-        for article in parse_document(final_report)
+        for article in parse_document(final_report, require_category_alignment=True)
     ]
     regular_profile = aggregate_profile(
         files,

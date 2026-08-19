@@ -114,6 +114,82 @@ class SafetyGuardTests(unittest.TestCase):
             "장관, 노력 “전적으로 이해”",
         )
 
+    def test_numeric_first_category_matches_by_name_without_shifting(self):
+        paragraphs = [
+            "□ 미래성장동력 7대 시드 보고회",
+            "ㅇ 첫 기사",
+            "□ 외교·안보",
+            "ㅇ 둘째 기사",
+            "미래성장동력 7대 시드 보고회",
+            "<첫 매체 8.10> 첫 기사",
+            "- 첫 기사 본문",
+            "외교 ‧ 안보",
+            "<둘째 매체 8.10> 둘째 기사",
+            "- 둘째 기사 본문",
+        ]
+        entries = process_job.front_entries(paragraphs)
+        self.assertTrue(process_job.is_body_category_candidate(paragraphs, 4))
+        mapping = process_job.body_category_map(paragraphs, entries)
+        self.assertEqual(
+            list(mapping.values()),
+            ["미래성장동력 7대 시드 보고회", "외교·안보"],
+        )
+        self.assertEqual(
+            process_job.final_category_alignment_errors(paragraphs, entries),
+            [],
+        )
+
+    def test_missing_body_category_cannot_shift_the_following_category(self):
+        paragraphs = [
+            "□ 미래성장동력 7대 시드 보고회",
+            "ㅇ 첫 기사",
+            "□ 외교·안보",
+            "ㅇ 둘째 기사",
+            "외교 ‧ 안보",
+            "<둘째 매체 8.10> 둘째 기사",
+            "- 둘째 기사 본문",
+        ]
+        entries = process_job.front_entries(paragraphs)
+        mapping = process_job.body_category_map(paragraphs, entries)
+        self.assertEqual(list(mapping.values()), ["외교·안보"])
+        errors = process_job.final_category_alignment_errors(paragraphs, entries)
+        self.assertTrue(any("미래성장동력 7대 시드 보고회" in error for error in errors))
+
+    def test_duplicate_body_category_fails_exact_sequence_check(self):
+        paragraphs = [
+            "□ 첫 분류",
+            "ㅇ 첫 기사",
+            "□ 둘째 분류",
+            "ㅇ 둘째 기사",
+            "첫 분류",
+            "<첫 매체 8.10> 첫 기사",
+            "- 첫 기사 본문",
+            "둘째 분류",
+            "<둘째 매체 8.10> 둘째 기사",
+            "- 둘째 기사 본문",
+            "둘째 분류",
+            "<셋째 매체 8.10> 셋째 기사",
+        ]
+        entries = process_job.front_entries(paragraphs)
+        errors = process_job.final_category_alignment_errors(paragraphs, entries)
+        self.assertTrue(any("개수·순서 불일치" in error for error in errors))
+
+    def test_final_report_rejects_category_sequence_mismatch(self):
+        paragraphs = [
+            "□ 첫 분류",
+            "ㅇ 첫 기사",
+            "□ 둘째 분류",
+            "ㅇ 둘째 기사",
+            "둘째 분류",
+            "<둘째 매체 8.10> 둘째 기사",
+        ]
+        with mock.patch.object(process_job, "extract_paragraphs", return_value=paragraphs):
+            with self.assertRaisesRegex(ValueError, "카테고리 구조 불일치"):
+                process_job.parse_document(
+                    Path("final.hwpx"),
+                    require_category_alignment=True,
+                )
+
     def test_reference_feedback_matches_unique_anchor_after_full_title_rewrite(self):
         row = [
             "", "8월 4일", "2조", "보조", "작업자갑", "", "",

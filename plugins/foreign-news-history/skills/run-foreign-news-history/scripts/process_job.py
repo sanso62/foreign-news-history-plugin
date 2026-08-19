@@ -436,7 +436,7 @@ def is_body_category_candidate(paragraphs: list[str], index: int) -> bool:
         return False
     if text.startswith(("-", "[", "<", "*", "ㅇ", "ᄋ", "", "□", "■", "▣")):
         return False
-    if re.search(r"\d", text) or re.search(r"[,，.!?。?!]$", text):
+    if re.search(r"[,，.!?。?!]$", text):
         return False
     # A body category is a short standalone label followed by an article heading,
     # optionally through bracketed subheadings.  No category vocabulary is assumed.
@@ -455,34 +455,124 @@ def is_body_category_candidate(paragraphs: list[str], index: int) -> bool:
     return False
 
 
-def body_category_map(paragraphs: list[str], entries: list[dict[str, str]]) -> dict[int, str]:
-    first_heading = next((index for index, text in enumerate(paragraphs) if ARTICLE_HEADING.match(text)), None)
-    if first_heading is None:
-        return {}
-    front_categories: list[str] = []
+def front_category_sequence(entries: list[dict[str, str]]) -> list[str]:
+    """Return the first-page category sequence without a fixed vocabulary."""
+    categories: list[str] = []
+    seen: set[str] = set()
     for entry in entries:
         category = clean_text(entry.get("category"))
-        if category and category not in front_categories:
-            front_categories.append(category)
+        key = normalize_key(category)
+        if category and key and key not in seen:
+            categories.append(category)
+            seen.add(key)
+    return categories
+
+
+def body_category_candidate_indices(paragraphs: list[str]) -> list[int]:
+    first_heading = next(
+        (index for index, text in enumerate(paragraphs) if ARTICLE_HEADING.match(text)),
+        None,
+    )
+    if first_heading is None:
+        return []
     last_front_article = max(
-        (index for index, text in enumerate(paragraphs[:first_heading]) if FRONT_ARTICLE.match(text)),
+        (
+            index
+            for index, text in enumerate(paragraphs[:first_heading])
+            if FRONT_ARTICLE.match(text)
+        ),
         default=-1,
     )
-    candidates = [
+    return [
         index
         for index in range(last_front_article + 1, len(paragraphs))
         if is_body_category_candidate(paragraphs, index)
     ]
+
+
+def body_category_map(paragraphs: list[str], entries: list[dict[str, str]]) -> dict[int, str]:
+    front_categories = front_category_sequence(entries)
+    front_by_key = {
+        normalize_key(category): category
+        for category in front_categories
+    }
     mapping: dict[int, str] = {}
-    for position, index in enumerate(candidates):
+    for index in body_category_candidate_indices(paragraphs):
         raw = clean_text(paragraphs[index]).strip("[] ")
-        mapping[index] = front_categories[position] if position < len(front_categories) else raw
+        if not front_by_key:
+            mapping[index] = raw
+            continue
+        # Match the actual category name, allowing punctuation/spacing variants.
+        # Never pair by ordinal position: one missed label would shift every
+        # following article into the preceding category.
+        canonical = front_by_key.get(normalize_key(raw))
+        if canonical:
+            mapping[index] = canonical
     return mapping
 
 
-def parse_document(path: Path) -> list[Article]:
+def final_category_alignment_errors(
+    paragraphs: list[str],
+    entries: list[dict[str, str]],
+) -> list[str]:
+    """Fail closed when first-page and body category structure disagree."""
+    front_categories = front_category_sequence(entries)
+    if not front_categories:
+        return ["최종보고서 첫 장 상위 카테고리를 찾지 못함"]
+
+    front_by_key = {
+        normalize_key(category): category
+        for category in front_categories
+    }
+    body_raw = [
+        clean_text(paragraphs[index]).strip("[] ")
+        for index in body_category_candidate_indices(paragraphs)
+    ]
+    body_known: list[str] = []
+    body_known_keys: list[str] = []
+    body_unknown: list[str] = []
+    for raw in body_raw:
+        key = normalize_key(raw)
+        canonical = front_by_key.get(key)
+        if not canonical:
+            body_unknown.append(raw)
+            continue
+        body_known.append(canonical)
+        body_known_keys.append(key)
+
+    front_keys = [normalize_key(category) for category in front_categories]
+    present_keys = set(body_known_keys)
+    missing = [
+        category
+        for category, key in zip(front_categories, front_keys)
+        if key not in present_keys
+    ]
+    errors: list[str] = []
+    if missing:
+        errors.append("본문에서 찾지 못한 첫 장 카테고리: " + ", ".join(missing))
+    if body_unknown:
+        errors.append("첫 장과 대응하지 않는 본문 카테고리 후보: " + ", ".join(body_unknown))
+    if not missing and not body_unknown and body_known_keys != front_keys:
+        errors.append(
+            "첫 장·본문 카테고리 개수·순서 불일치: "
+            + " → ".join(body_known)
+        )
+    return errors
+
+
+def parse_document(
+    path: Path,
+    *,
+    require_category_alignment: bool = False,
+) -> list[Article]:
     paragraphs = extract_paragraphs(path)
     entries = front_entries(paragraphs)
+    if require_category_alignment:
+        category_errors = final_category_alignment_errors(paragraphs, entries)
+        if category_errors:
+            raise ValueError(
+                "최종보고서 카테고리 구조 불일치: " + "; ".join(category_errors)
+            )
     category_positions = body_category_map(paragraphs, entries)
     category = ""
     articles: list[Article] = []
@@ -2888,7 +2978,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     final_hash = sha256_file(final_report)
-    final_articles = parse_document(final_report)
+    final_articles = parse_document(final_report, require_category_alignment=True)
     if not final_articles:
         raise ValueError("최종보고서에서 기사 제목을 찾지 못했습니다.")
     warnings.extend(apply_article_overrides(final_articles, run_context))
