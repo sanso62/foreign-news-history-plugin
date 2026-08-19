@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Filter a bounded Google Sheets range scan to the required report date.
+"""Filter a bounded Google Sheets range scan to the required regular-work window.
 
 The connector must read FORMATTED_VALUE cells.  This script parses those visible
 values locally so a guessed search string can never silently produce a partial
 regular-history set.
+
+The ordinary window is the target report date. One narrow carry-over window is
+also retained: a row worked on the target date whose report date is exactly one
+day earlier. That is the auditable shape produced when an older regular item is
+held from the afternoon aggregate and reintroduced in the following morning
+aggregate.
 """
 
 from __future__ import annotations
@@ -64,10 +70,25 @@ def main() -> int:
     if "보도일" not in headers or "제목 (한글)" not in headers:
         raise ValueError("작업내역 범위 조회에 필수 열 보도일/제목 (한글)이 없습니다.")
     date_index = headers.index("보도일")
-    filtered = [
-        row for row in values[1:]
-        if date_index < len(row) and parse_date(row[date_index]) == target_date
-    ]
+    work_date_index = headers.index("작업날짜") if "작업날짜" in headers else None
+    previous_date = target_date - dt.timedelta(days=1)
+    filtered: list[list[Any]] = []
+    report_date_matches = 0
+    work_date_carryovers = 0
+    for row in values[1:]:
+        report_date = parse_date(row[date_index]) if date_index < len(row) else None
+        work_date = (
+            parse_date(row[work_date_index])
+            if work_date_index is not None and work_date_index < len(row)
+            else None
+        )
+        report_date_match = report_date == target_date
+        work_date_carryover = work_date == target_date and report_date == previous_date
+        if not (report_date_match or work_date_carryover):
+            continue
+        filtered.append(row)
+        report_date_matches += int(report_date_match)
+        work_date_carryovers += int(work_date_carryover and not report_date_match)
     if not filtered:
         raise ValueError(f"작업내역 전체 범위에서 {target_date.isoformat()} 행을 찾지 못했습니다.")
     payload = {
@@ -80,8 +101,11 @@ def main() -> int:
             "scan_range": scan_ranges[0] if len(scan_ranges) == 1 else "",
             "scan_ranges": scan_ranges,
             "target_date": target_date.isoformat(),
+            "selection_rule": "report_date_or_one_day_work_date_carryover",
             "scanned_row_count": max(0, len(values) - 1),
             "matched_row_count": len(filtered),
+            "matched_by_report_date_count": report_date_matches,
+            "matched_by_work_date_carryover_count": work_date_carryovers,
             "source_file": str(input_path),
         },
         "values": [headers, *filtered],

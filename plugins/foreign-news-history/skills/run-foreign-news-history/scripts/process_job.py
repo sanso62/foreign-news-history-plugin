@@ -794,6 +794,22 @@ def role_semantic_errors(
     actual_edit_source_kind = clean_text(actual_edit_source_kind)
     errors: list[str] = []
 
+    if source_type == "regular":
+        expected_group, expected_owner = REFERENCE_ROLE_LABELS[source_type]
+        if actual_edit_source_kind:
+            actual_edit_role = WORKFILE_ROLE_LABELS.get(actual_edit_source_kind)
+            if actual_edit_role is None:
+                errors.append(
+                    f"정기 유입 실제 편집 source_kind 미확인: {actual_edit_source_kind}"
+                )
+            else:
+                expected_owner = actual_edit_role[1]
+        if workgroup and workgroup != expected_group:
+            errors.append(f"{source_type} 작업조는 {expected_group}이어야 함")
+        if owner and owner != expected_owner:
+            errors.append(f"{source_type} 초벌 담당은 {expected_owner}이어야 함")
+        return errors
+
     if source_type in REFERENCE_ROLE_LABELS:
         expected_group, expected_owner = REFERENCE_ROLE_LABELS[source_type]
         if workgroup and workgroup != expected_group:
@@ -944,7 +960,12 @@ def regular_candidates(
     candidates: list[Candidate] = []
     for row in rows:
         row_date = parse_date(row.get("보도일"))
-        if row_date != target_date:
+        work_date = parse_date(row.get("작업날짜"))
+        one_day_work_date_carryover = bool(
+            work_date == target_date
+            and row_date == target_date - dt.timedelta(days=1)
+        )
+        if row_date != target_date and not one_day_work_date_carryover:
             continue
         title = clean_text(row.get("제목 (한글)"))
         if not title:
@@ -964,6 +985,7 @@ def regular_candidates(
                 extra={
                     **row,
                     "comparison_stage": "reference",
+                    "one_day_work_date_carryover": one_day_work_date_carryover,
                     "priority": int((profile or {}).get("priority", 0)),
                     "profile_complete": profile_complete,
                     "profile_evidence": (profile or {}).get("evidence", []),
@@ -1399,6 +1421,56 @@ def ranked_origin_matches(
     )
 
 
+def unique_rewritten_trend_duplicate(
+    article: Article,
+    regular_candidates: list[Candidate],
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> tuple[float, Candidate] | None:
+    """Recover a uniquely rewritten direct trend draft duplicated in regular history.
+
+    A direct draft can be retitled in an aggregate far enough to fall below the
+    normal review threshold. Treat it as the same trend-work item only when the
+    regular match is automatic, exactly one direct draft has compatible media
+    and date plus meaningful residual title overlap, and a later aggregate
+    independently carries the final title at the automatic threshold.
+    """
+    if not ranked_origin_matches(
+        article,
+        regular_candidates,
+        matching["auto_threshold"],
+    ):
+        return None
+    direct_drafts = [
+        candidate
+        for candidate in worker_candidates
+        if clean_text(candidate.extra.get("source_kind")) in INITIAL_DRAFT_SOURCE_KINDS
+    ]
+    residual_threshold = matching["review_threshold"] * 0.8
+    compatible: list[tuple[float, Candidate]] = []
+    article_date = parse_date(article.date)
+    for candidate in direct_drafts:
+        if media_similarity(article.media, candidate.media) < 0.85:
+            continue
+        candidate_date = parse_date(candidate.date)
+        if article_date and candidate_date and article_date != candidate_date:
+            continue
+        score = candidate_score(article, candidate)
+        if score >= residual_threshold:
+            compatible.append((score, candidate))
+    if len(compatible) != 1:
+        return None
+
+    aggregate_kinds = {"afternoon_aggregate", "morning_aggregate"}
+    aggregate_match = any(
+        clean_text(candidate.extra.get("source_kind")) in aggregate_kinds
+        and media_similarity(article.media, candidate.media) >= 0.85
+        and candidate_score(article, candidate) >= matching["auto_threshold"]
+        for candidate in worker_candidates
+    )
+    return compatible[0] if aggregate_match else None
+
+
 def enrich_special_source_roles(
     candidates: list[Candidate],
     worker_candidates: list[Candidate],
@@ -1709,13 +1781,21 @@ def choose_origin(
         pools.get("japan", []),
         matching,
     )
+    rewritten_trend = unique_rewritten_trend_duplicate(
+        article,
+        pools.get("regular", []),
+        workers,
+        matching,
+    )
     rewritten_reference_selected = False
+    rewritten_trend_selected = False
 
-    # An individual draft is direct article-level provenance.  A strong reference
-    # match stays authoritative even when the same text was copied into a later
-    # draft.  Below the automatic threshold, a draft can take precedence only
-    # when it is automatic and materially stronger.  If no reference reaches the
-    # review threshold, a clear review-threshold draft is sufficient provenance.
+    # An individual domestic/global trend draft is direct article-level
+    # provenance. When it automatically matches a duplicate regular-history
+    # item, the human workflow credits the trend draft. Aggregates and other
+    # copied workfiles do not receive this override. A strong Japan source keeps
+    # its special-source treatment. Below the automatic threshold, the prior
+    # materially-stronger safeguards still apply.
     reference_choice: tuple[float, Candidate] | None = None
     for source_type in REFERENCE_SOURCE_ORDER:
         ranked = ranked_by_source.get(source_type, [])
@@ -1724,6 +1804,14 @@ def choose_origin(
             break
     if ranked_initial_drafts:
         initial_score, initial_candidate = ranked_initial_drafts[0]
+        automatic_regular_duplicate = bool(
+            ranked_by_source.get("regular")
+            and initial_score >= matching["auto_threshold"]
+            and not (
+                ranked_by_source.get("japan")
+                and ranked_by_source["japan"][0][0] >= matching["auto_threshold"]
+            )
+        )
         reference_score = (
             reference_choice[0]
             if reference_choice
@@ -1733,7 +1821,8 @@ def choose_origin(
             )
         )
         draft_preferred = bool(
-            (
+            automatic_regular_duplicate
+            or (
                 reference_choice is None
                 and initial_score - reference_score >= matching["ambiguity_margin"]
             )
@@ -1748,6 +1837,19 @@ def choose_origin(
             chosen_ranked = ranked_initial_drafts
             chosen_score, chosen = initial_score, initial_candidate
             chosen_stage = clean_text(initial_candidate.extra.get("comparison_stage")) or "afternoon"
+
+    if (
+        chosen is None
+        and rewritten_trend is not None
+        and not (
+            ranked_by_source.get("japan")
+            and ranked_by_source["japan"][0][0] >= matching["auto_threshold"]
+        )
+    ):
+        chosen_score, chosen = rewritten_trend
+        chosen_ranked = [rewritten_trend]
+        chosen_stage = clean_text(chosen.extra.get("comparison_stage")) or "afternoon"
+        rewritten_trend_selected = True
 
     if rewritten_japan is not None:
         chosen_score, chosen = rewritten_japan
@@ -1800,6 +1902,7 @@ def choose_origin(
         chosen_score < matching["auto_threshold"]
         and not clear_initial_draft
         and not rewritten_reference_selected
+        and not rewritten_trend_selected
     ):
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
@@ -2345,6 +2448,101 @@ def late_morning_aggregate_origin(
     )
 
 
+def regular_reintroduced_in_morning_origin(
+    article: Article,
+    origin: Candidate | None,
+    pools: dict[str, list[Candidate]],
+    matching: dict[str, float],
+    target_date: dt.date,
+) -> Candidate | None:
+    """Keep a narrow regular/morning hybrid for a one-day carry-over item.
+
+    This does not change ordinary regular attribution. It applies only when the
+    selected regular row was worked on the target date but reported exactly one
+    day earlier, the article is absent from every afternoon input, and an
+    automatic match first appears in a complete morning aggregate with no
+    competing morning individual/auxiliary draft.
+    """
+    if origin is None or origin.source_type != "regular":
+        return origin
+    if not origin.extra.get("one_day_work_date_carryover"):
+        return origin
+    if parse_date(origin.extra.get("작업날짜")) != target_date:
+        return origin
+    if parse_date(origin.extra.get("보도일")) != target_date - dt.timedelta(days=1):
+        return origin
+
+    workers = pools.get("worker", [])
+    afternoon = [
+        candidate
+        for candidate in workers
+        if clean_text(candidate.extra.get("comparison_stage")) == "afternoon"
+    ]
+    if ranked_origin_matches(article, afternoon, matching["review_threshold"]):
+        return origin
+
+    morning_non_aggregates = [
+        candidate
+        for candidate in workers
+        if clean_text(candidate.extra.get("comparison_stage")) == "morning"
+        and clean_text(candidate.extra.get("source_kind")) != "morning_aggregate"
+    ]
+    if ranked_origin_matches(
+        article,
+        morning_non_aggregates,
+        matching["review_threshold"],
+    ):
+        return origin
+
+    morning_aggregates = [
+        candidate
+        for candidate in workers
+        if clean_text(candidate.extra.get("comparison_stage")) == "morning"
+        and clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+        and candidate.extra.get("profile_complete", False)
+    ]
+    automatic_matches = [
+        (candidate_score(article, candidate), candidate)
+        for candidate in morning_aggregates
+        if candidate_score(article, candidate) >= matching["auto_threshold"]
+    ]
+    if not automatic_matches:
+        return origin
+    score, selected = min(
+        automatic_matches,
+        key=lambda pair: (
+            workfile_revision_rank(pair[1].source_file),
+            -pair[0],
+            int(pair[1].extra.get("article_order", 0)),
+        ),
+    )
+    evidence = [
+        *origin.extra.get("profile_evidence", []),
+        *selected.extra.get("profile_evidence", []),
+        (
+            "정기 전일 보도분이 오후 입력에는 없고 오전 총괄본에서 최초 재반영됨: "
+            f"{Path(selected.source_file).name} (일치 {score:.3f})"
+        ),
+    ]
+    return replace(
+        origin,
+        owner=selected.owner,
+        worker=selected.worker,
+        extra={
+            **origin.extra,
+            "actual_edit_stage": "morning",
+            "actual_edit_file": selected.source_file,
+            "actual_edit_source_kind": "morning_aggregate",
+            "regular_reintroduced_in_morning": True,
+            "profile_complete": True,
+            "profile_evidence": list(
+                dict.fromkeys(clean_text(item) for item in evidence if clean_text(item))
+            ),
+            "schedule_refs": list(selected.extra.get("schedule_refs", [])),
+        },
+    )
+
+
 def reorder_front_only_results(
     articles: list[Article],
     rows: list[list[Any]],
@@ -2885,6 +3083,13 @@ def main() -> int:
                 reasons = [reason for reason in reasons if reason != "유입 경로를 확인하지 못함"]
             if not origin.extra.get("profile_complete", False):
                 reasons.append("유입 파일의 작업자·역할 근거 불완전")
+        origin = regular_reintroduced_in_morning_origin(
+            article,
+            origin,
+            pools,
+            config["matching"],
+            target_date,
+        )
         origin = late_morning_aggregate_origin(
             article,
             origin,

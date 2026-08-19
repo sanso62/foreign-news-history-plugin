@@ -56,7 +56,9 @@ class SafetyGuardTests(unittest.TestCase):
             ]):
                 self.assertEqual(0, prepare_source_history.main())
             payload = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(2, payload["source_audit"]["matched_row_count"])
+            self.assertEqual(3, payload["source_audit"]["matched_row_count"])
+            self.assertEqual(2, payload["source_audit"]["matched_by_report_date_count"])
+            self.assertEqual(1, payload["source_audit"]["matched_by_work_date_carryover_count"])
             self.assertEqual([], process_job.source_scan_audit_errors(
                 output, process_job.dt.date(2026, 7, 22)
             ))

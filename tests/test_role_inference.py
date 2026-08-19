@@ -218,7 +218,7 @@ class OriginOrderTests(unittest.TestCase):
         self.assertIs(draft, chosen)
         self.assertEqual([], reasons)
 
-    def test_near_equal_individual_draft_keeps_regular_origin(self):
+    def test_automatic_regular_duplicate_uses_direct_trend_draft(self):
         article = process_job.Article(
             "final.hwp", 1, "분류", "현재 매체", "8.10", "동일 기사", "동일 기사"
         )
@@ -235,6 +235,112 @@ class OriginOrderTests(unittest.TestCase):
         )
         chosen, _, reasons, _ = process_job.choose_origin(
             article, {"regular": [regular], "japan": [], "worker": [draft]}, self.MATCHING
+        )
+        self.assertIs(draft, chosen)
+        self.assertEqual([], reasons)
+
+    def test_direct_trend_draft_does_not_erase_strong_japan_source(self):
+        article = process_job.Article(
+            "final.hwp", 1, "분류", "현재 매체", "8.10", "동일 기사", "동일 기사"
+        )
+        regular = process_job.Candidate(
+            "regular", "동일 기사", "현재 매체", "8.10",
+            extra={"profile_complete": True},
+        )
+        japan = process_job.Candidate(
+            "japan", "동일 기사", "현재 매체", "8.10",
+            workgroup="일본문화원", owner="보조", worker="작업자정",
+            extra={"profile_complete": True},
+        )
+        draft = process_job.Candidate(
+            "worker", "동일 기사", "현재 매체", "8.10",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "priority": 100,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [japan], "worker": [draft]},
+            self.MATCHING,
+        )
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_unique_rewritten_trend_draft_uses_aggregate_lineage(self):
+        article = process_job.Article(
+            "final.hwp", 1, "북한", "AFP", "8.12",
+            "북한, 동해상에 탄도미사일 발사",
+            "북한, 동해상에 탄도미사일 발사",
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "AFP", "8.12",
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"profile_complete": True},
+        )
+        draft = process_job.Candidate(
+            "worker", "북한, 한미 연합훈련 앞두고 탄도미사일 발사", "AFP", "8.12",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "profile_complete": True, "comparison_stage": "afternoon",
+                "source_kind": "domestic_draft",
+            },
+        )
+        aggregate = process_job.Candidate(
+            "worker", article.body_title, "AFP", "8.12",
+            workgroup="오후", owner="오후/총괄", worker="작업자병",
+            extra={
+                "profile_complete": True, "comparison_stage": "afternoon",
+                "source_kind": "afternoon_aggregate",
+            },
+        )
+        chosen, score, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [], "worker": [draft, aggregate]},
+            self.MATCHING,
+        )
+        self.assertIs(draft, chosen)
+        self.assertLess(score, self.MATCHING["review_threshold"])
+        self.assertEqual([], reasons)
+
+    def test_ambiguous_rewritten_trend_lineage_keeps_regular(self):
+        article = process_job.Article(
+            "final.hwp", 1, "북한", "AFP", "8.12",
+            "북한, 동해상에 탄도미사일 발사",
+            "북한, 동해상에 탄도미사일 발사",
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "AFP", "8.12",
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"profile_complete": True},
+        )
+        drafts = [
+            process_job.Candidate(
+                "worker", title, "AFP", "8.12",
+                workgroup="1조", owner="국내", worker="작업자을",
+                extra={
+                    "profile_complete": True, "comparison_stage": "afternoon",
+                    "source_kind": "domestic_draft",
+                },
+            )
+            for title in (
+                "북한, 한미 연합훈련 앞두고 탄도미사일 발사",
+                "북한, 연합훈련 전 동해상 탄도미사일 시험",
+            )
+        ]
+        aggregate = process_job.Candidate(
+            "worker", article.body_title, "AFP", "8.12",
+            workgroup="오후", owner="오후/총괄", worker="작업자병",
+            extra={
+                "profile_complete": True, "comparison_stage": "afternoon",
+                "source_kind": "afternoon_aggregate",
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [], "worker": [*drafts, aggregate]},
+            self.MATCHING,
         )
         self.assertIs(regular, chosen)
         self.assertEqual([], reasons)
@@ -675,6 +781,92 @@ class AggregateRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(("1조", "오후/총괄"), (changed.workgroup, changed.owner))
         self.assertEqual("late_morning_aggregate", changed.extra["source_kind"])
+
+    def test_one_day_regular_carryover_absent_in_afternoon_uses_morning_editor(self):
+        target_date = process_job.dt.date(2026, 8, 12)
+        article = process_job.Article(
+            "final.hwp", 1, "국제", "NHK", "8.11",
+            "대통령이 미사일 공격을 언급", "대통령이 미사일 공격을 언급",
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "NHK", "8.11",
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={
+                "profile_complete": True,
+                "comparison_stage": "reference",
+                "one_day_work_date_carryover": True,
+                "작업날짜": "2026. 8. 12",
+                "보도일": "2026. 8. 11",
+            },
+        )
+        morning = process_job.Candidate(
+            "worker", article.body_title, "NHK", "8.11",
+            source_file="morning 1차.hwp",
+            workgroup="2조", owner="오전/총괄", worker="작업자정",
+            extra={
+                "profile_complete": True,
+                "comparison_stage": "morning",
+                "source_kind": "morning_aggregate",
+                "schedule_refs": ["근무!월요일:R6"],
+                "profile_evidence": ["오전 총괄 파일과 근무표 확인"],
+            },
+        )
+        changed = process_job.regular_reintroduced_in_morning_origin(
+            article,
+            regular,
+            {"regular": [regular], "japan": [], "worker": [morning]},
+            self.MATCHING,
+            target_date,
+        )
+        self.assertEqual(
+            ("정기", "오전/총괄", "작업자정"),
+            (changed.workgroup, changed.owner, changed.worker),
+        )
+        self.assertEqual("morning_aggregate", changed.extra["actual_edit_source_kind"])
+        self.assertEqual([], process_job.role_semantic_errors(
+            "regular", "", changed.workgroup, changed.owner,
+            changed.extra["actual_edit_source_kind"],
+        ))
+
+    def test_regular_carryover_stays_regular_when_afternoon_contains_article(self):
+        target_date = process_job.dt.date(2026, 8, 12)
+        article = process_job.Article(
+            "final.hwp", 1, "국제", "NHK", "8.11", "기사", "기사"
+        )
+        regular = process_job.Candidate(
+            "regular", "기사", "NHK", "8.11",
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={
+                "profile_complete": True,
+                "one_day_work_date_carryover": True,
+                "작업날짜": "2026. 8. 12",
+                "보도일": "2026. 8. 11",
+            },
+        )
+        afternoon = process_job.Candidate(
+            "worker", "기사", "NHK", "8.11",
+            workgroup="오후", owner="오후/총괄", worker="작업자병",
+            extra={
+                "profile_complete": True, "comparison_stage": "afternoon",
+                "source_kind": "afternoon_aggregate",
+            },
+        )
+        morning = process_job.Candidate(
+            "worker", "기사", "NHK", "8.11", source_file="morning 1차.hwp",
+            workgroup="2조", owner="오전/총괄", worker="작업자정",
+            extra={
+                "profile_complete": True, "comparison_stage": "morning",
+                "source_kind": "morning_aggregate",
+            },
+        )
+        unchanged = process_job.regular_reintroduced_in_morning_origin(
+            article,
+            regular,
+            {"regular": [regular], "japan": [], "worker": [afternoon, morning]},
+            self.MATCHING,
+            target_date,
+        )
+        self.assertIs(regular, unchanged)
 
     def test_front_only_same_file_packet_stays_together(self):
         articles = [
