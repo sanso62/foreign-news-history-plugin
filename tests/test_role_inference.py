@@ -185,6 +185,70 @@ class OriginOrderTests(unittest.TestCase):
         )
         self.assertEqual({("오전/총괄", "작업자병")}, {(item.owner, item.worker) for item in result})
 
+    def test_nearly_complete_japan_auxiliary_keeps_only_substantive_matches(self):
+        japan = [
+            process_job.Candidate(
+                "japan", title, media, "8.12", workgroup="일본문화원",
+                extra={"body_content_count": body_count},
+            )
+            for title, media, body_count in (
+                ("첫 기사", "첫 매체", 1),
+                ("둘째 기사", "둘째 매체", 0),
+                ("셋째 기사", "셋째 매체", 1),
+            )
+        ]
+        auxiliary = [
+            process_job.Candidate(
+                "worker", title, media, "8.12", source_file="auxiliary.hwp",
+                owner="보조", worker="작업자정", extra={
+                    "comparison_stage": "morning", "profile_complete": True,
+                    "source_kind": "morning_auxiliary", "schedule_refs": ["근무!6"],
+                },
+            )
+            for title, media in (("첫 기사", "첫 매체"), ("둘째 기사", "둘째 매체"))
+        ]
+        aggregate = [
+            process_job.Candidate(
+                "worker", item.title, item.media, "8.12", source_file="aggregate.hwp",
+                owner="오전/총괄", worker="작업자병", extra={
+                    "comparison_stage": "morning", "profile_complete": True,
+                    "source_kind": "morning_aggregate", "schedule_refs": ["근무!5"],
+                },
+            )
+            for item in japan
+        ]
+        result = process_job.enrich_special_source_roles(
+            japan, [*auxiliary, *aggregate], {"review_threshold": 0.9}
+        )
+        self.assertEqual(
+            [("보조", "작업자정"), ("오전/총괄", "작업자병"), ("오전/총괄", "작업자병")],
+            [(item.owner, item.worker) for item in result],
+        )
+
+    def test_current_schema_conflict_qualifies_only_direct_identity(self):
+        article = process_job.Article(
+            "final.hwp", 1, "경제", "Bloomberg", "8.12", "최종 제목", "최종 제목"
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "Bloomberg", "8.12",
+            extra={"source_history_operational_fields": True},
+        )
+        exact = process_job.Candidate(
+            "worker", article.body_title, "Bloomberg", "8.12",
+            owner="국내", extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+            },
+        )
+        rewritten = replace(exact, title="초안 단계의 다른 제목")
+        qualified = process_job.qualify_current_schema_draft_conflict(
+            article, exact, [regular], self.MATCHING
+        )
+        unchanged = process_job.qualify_current_schema_draft_conflict(
+            article, rewritten, [regular], self.MATCHING
+        )
+        self.assertEqual("오후/국내", qualified.owner)
+        self.assertEqual("국내", unchanged.owner)
+
     def test_slash_group_sets_representative_title(self):
         articles = [
             process_job.Article("sample.hwp", 1, "분류", "첫 매체", "8.3", "첫 제목", "첫 제목"),
@@ -219,7 +283,7 @@ class OriginOrderTests(unittest.TestCase):
         self.assertIs(draft, chosen)
         self.assertEqual([], reasons)
 
-    def test_automatic_regular_duplicate_uses_direct_trend_draft(self):
+    def test_exact_regular_duplicate_keeps_reference_precedence(self):
         article = process_job.Article(
             "final.hwp", 1, "분류", "현재 매체", "8.10", "동일 기사", "동일 기사"
         )
@@ -237,7 +301,66 @@ class OriginOrderTests(unittest.TestCase):
         chosen, _, reasons, _ = process_job.choose_origin(
             article, {"regular": [regular], "japan": [], "worker": [draft]}, self.MATCHING
         )
-        self.assertIs(draft, chosen)
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_retitled_representative_uses_regular_explicit_similar_cluster(self):
+        article = process_job.Article(
+            "final.hwp", 1, "산업", "Bloomberg", "8.3",
+            "AI chip designer DeepX value jumps to 2.2 billion dollars",
+            "AI chip designer DeepX value jumps to 2.2 billion dollars",
+        )
+        regular = process_job.Candidate(
+            "regular", "Korean AI chip startup DeepX value jumps to 2.2 billion dollars",
+            "Bloomberg", "8.3", workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"profile_complete": True, "comparison_stage": "reference"},
+        )
+        draft = process_job.Candidate(
+            "worker", article.body_title, "Bloomberg", "8.3",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "priority": 100, "body_content_count": 3,
+            },
+        )
+        similar = process_job.Candidate(
+            "worker", regular.title, "Bloomberg", "", source_file="morning aggregate.hwp",
+            extra={
+                "source_kind": "morning_aggregate", "comparison_stage": "morning",
+                "profile_complete": True, "similar": True,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [], "worker": [draft, similar]},
+            self.MATCHING,
+        )
+        self.assertIs(regular, chosen)
+        self.assertEqual([], reasons)
+
+    def test_exact_title_and_date_accept_translated_outlet_reference(self):
+        article = process_job.Article(
+            "final.hwp", 1, "산업", "번역 매체명", "4.2", "동일한 기사 제목", "동일한 기사 제목"
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "Original Outlet", "4.2",
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"profile_complete": True, "comparison_stage": "reference"},
+        )
+        draft = process_job.Candidate(
+            "worker", "동일한 기사 제목의 후속 초안", article.media, "4.2",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "profile_complete": True, "body_content_count": 2,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [], "worker": [draft]},
+            self.MATCHING,
+        )
+        self.assertIs(regular, chosen)
         self.assertEqual([], reasons)
 
     def test_direct_trend_draft_does_not_erase_strong_japan_source(self):
@@ -274,6 +397,8 @@ class OriginOrderTests(unittest.TestCase):
             "final.hwp", 1, "북한", "AFP", "8.12",
             "북한, 동해상에 탄도미사일 발사",
             "북한, 동해상에 탄도미사일 발사",
+            similar=True,
+            raw_heading="<AFP> 북한, 동해상에 탄도미사일 발사",
         )
         regular = process_job.Candidate(
             "regular", article.body_title, "AFP", "8.12",
@@ -285,7 +410,7 @@ class OriginOrderTests(unittest.TestCase):
             workgroup="1조", owner="국내", worker="작업자을",
             extra={
                 "profile_complete": True, "comparison_stage": "afternoon",
-                "source_kind": "domestic_draft",
+                "source_kind": "domestic_draft", "body_content_count": 3,
             },
         )
         aggregate = process_job.Candidate(
@@ -303,6 +428,43 @@ class OriginOrderTests(unittest.TestCase):
         )
         self.assertIs(draft, chosen)
         self.assertLess(score, self.MATCHING["review_threshold"])
+        self.assertEqual([], reasons)
+
+    def test_bodyless_similar_draft_is_not_substantive_rewrite_lineage(self):
+        article = process_job.Article(
+            "final.hwp", 1, "북한", "UPI", "",
+            "북한, 한미 연합훈련 앞두고 탄도미사일 발사",
+            "북한, 한미 연합훈련 앞두고 탄도미사일 발사",
+            similar=True,
+            raw_heading="<UPI> 북한, 한미 연합훈련 앞두고 탄도미사일 발사",
+        )
+        regular = process_job.Candidate(
+            "regular", article.body_title, "UPI", "8.12",
+            workgroup="정기", owner="오후/총괄", worker="작업자병",
+            extra={"profile_complete": True, "comparison_stage": "reference"},
+        )
+        copied_heading = process_job.Candidate(
+            "worker", article.body_title, "UPI", "",
+            workgroup="1조", owner="국내", worker="작업자을",
+            extra={
+                "profile_complete": True, "comparison_stage": "afternoon",
+                "source_kind": "domestic_draft", "similar": True,
+                "body_content_count": 0,
+            },
+        )
+        aggregate = process_job.Candidate(
+            "worker", article.body_title, "UPI", "",
+            extra={
+                "profile_complete": True, "comparison_stage": "afternoon",
+                "source_kind": "afternoon_aggregate", "similar": True,
+            },
+        )
+        chosen, _, reasons, _ = process_job.choose_origin(
+            article,
+            {"regular": [regular], "japan": [], "worker": [copied_heading, aggregate]},
+            self.MATCHING,
+        )
+        self.assertIs(regular, chosen)
         self.assertEqual([], reasons)
 
     def test_ambiguous_rewritten_trend_lineage_keeps_regular(self):
@@ -712,6 +874,45 @@ class AggregateRecoveryTests(unittest.TestCase):
         self.assertEqual(("1조", "오후/총괄"), (omitted[0].workgroup, omitted[0].owner))
         self.assertEqual("afternoon_aggregate_omitted", omitted[0].extra["source_kind"])
 
+    def test_omitted_candidates_follow_afternoon_then_morning_comparison_order(self):
+        final = process_job.Article(
+            "final.hwp", 1, "분류", "Alpha Wire", "8.3",
+            "Quantum market outlook", "Quantum market outlook"
+        )
+        morning = process_job.Candidate(
+            "worker", "Volcanic evacuation notice", "Beta Press", "8.3",
+            extra={
+                "source_kind": "morning_auxiliary", "comparison_stage": "morning",
+                "include_unmatched": True, "priority": 100,
+            },
+        )
+        afternoon = process_job.Candidate(
+            "worker", "Marine treaty ratification", "Gamma Daily", "8.3",
+            extra={
+                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
+                "include_unmatched": True, "priority": 100,
+            },
+        )
+        omitted = process_job.omitted_worker_candidates(
+            [final], [morning, afternoon], self.MATCHING
+        )
+        self.assertEqual([afternoon, morning], omitted)
+
+    def test_omitted_candidate_preserves_explicit_unmapped_source_category(self):
+        final = process_job.Article(
+            "final.hwp", 1, "경제", "Alpha Wire", "8.3",
+            "Quantum market outlook", "Quantum market outlook"
+        )
+        omitted = process_job.Candidate(
+            "worker", "Volcanic evacuation notice", "Beta Press", "8.3",
+            extra={"category": "특검 수사 관련"},
+        )
+        category, resolved = process_job.omitted_candidate_category(
+            omitted, [], self.MATCHING
+        )
+        self.assertEqual("특검 수사 관련", category)
+        self.assertTrue(resolved)
+
     def test_latest_category_only_extends_a_compatible_final_category(self):
         social = process_job.Article(
             "final.hwp", 1, "사회", "BBC", "8.3", "폭염 기사", "폭염 기사"
@@ -782,6 +983,45 @@ class AggregateRecoveryTests(unittest.TestCase):
         )
         self.assertEqual(("1조", "오후/총괄"), (changed.workgroup, changed.owner))
         self.assertEqual("late_morning_aggregate", changed.extra["source_kind"])
+
+    def test_current_source_schema_uses_morning_late_aggregate_role(self):
+        article = process_job.Article(
+            "final.hwp", 1, "증시", "현재 매체", "8.3", "새 기사", "새 기사"
+        )
+        origin = process_job.Candidate(
+            "worker", article.body_title, article.media, article.date,
+            source_file="morning 2차.hwp", workgroup="2조", owner="오전/총괄", worker="작업자병",
+            extra={"source_kind": "morning_aggregate", "comparison_stage": "morning"},
+        )
+        current_regular = process_job.Candidate(
+            "regular", "다른 정기 기사", "다른 매체", "8.2",
+            extra={"source_history_operational_fields": True},
+        )
+        changed = process_job.late_morning_aggregate_origin(
+            article,
+            origin,
+            {"regular": [current_regular], "japan": [], "worker": [origin]},
+            self.MATCHING,
+            process_job.dt.date(2026, 8, 3),
+        )
+        self.assertEqual(("1조", "오전/총괄"), (changed.workgroup, changed.owner))
+
+    def test_adjacent_compound_category_uses_workfile_spelling_without_alias_table(self):
+        mappings = process_job.adjacent_compound_category_labels(
+            ["첫 분류", "둘째 분류", "셋째 분류"],
+            ["첫 분류", "둘째 분류‧셋째 분류"],
+        )
+        self.assertEqual(
+            {process_job.normalize_key("둘째 분류"): "둘째 분류‧셋째 분류"},
+            mappings,
+        )
+
+    def test_adjacent_compound_category_requires_explicit_workfile_label(self):
+        mappings = process_job.adjacent_compound_category_labels(
+            ["첫 분류", "둘째 분류"],
+            ["첫 분류", "둘째 분류"],
+        )
+        self.assertEqual({}, mappings)
 
     def test_one_day_regular_carryover_absent_in_afternoon_uses_morning_editor(self):
         target_date = process_job.dt.date(2026, 8, 12)

@@ -105,6 +105,7 @@ class Article:
     starred: bool = False
     similar: bool = False
     body_present: bool = False
+    body_content_count: int = 0
     raw_heading: str = ""
     front_title_applied: bool = False
     group_representative: bool = False
@@ -601,17 +602,22 @@ def parse_document(
         articles.append(article)
         positions.append(index)
 
+    body_category_indices = set(body_category_candidate_indices(paragraphs))
     for article_index, article in enumerate(articles):
         start = positions[article_index] + 1
         end = positions[article_index + 1] if article_index + 1 < len(positions) else len(paragraphs)
         content = []
-        for paragraph in paragraphs[start:end]:
+        for paragraph_index in range(start, end):
+            if paragraph_index in body_category_indices:
+                break
+            paragraph = paragraphs[paragraph_index]
             if paragraph.startswith("[") and paragraph.endswith("]"):
                 break
             cleaned = paragraph.lstrip("- ").strip()
             if cleaned:
                 content.append(cleaned)
         article.body_present = bool(content)
+        article.body_content_count = len(content)
 
     apply_front_titles(articles, entries)
     previous_category = ""
@@ -915,8 +921,18 @@ def role_semantic_errors(
         expected_group, expected_owner = expected
         if workgroup and workgroup not in {expected_group, "순방"}:
             errors.append(f"{source_kind} 작업조는 {expected_group} 또는 근거 있는 순방이어야 함")
-        if owner and owner != expected_owner:
-            errors.append(f"{source_kind} 초벌 담당은 {expected_owner}이어야 함")
+        allowed_owners = {expected_owner}
+        if source_kind in INITIAL_DRAFT_SOURCE_KINDS:
+            # A current-schema draft can retain its base role while recording
+            # which comparison stage resolved a regular-history conflict.
+            allowed_owners.update({f"오전/{expected_owner}", f"오후/{expected_owner}"})
+        elif source_kind == "late_morning_aggregate":
+            # Legacy snapshots treated this as the afternoon total role, while
+            # current snapshots carry the morning-total role explicitly.
+            allowed_owners.update({"오전/총괄", "오후/총괄"})
+        if owner and owner not in allowed_owners:
+            expected_labels = " 또는 ".join(sorted(allowed_owners))
+            errors.append(f"{source_kind} 초벌 담당은 {expected_labels}이어야 함")
         return errors
 
     if source_type == "japan":
@@ -1080,6 +1096,9 @@ def regular_candidates(
                     "profile_complete": profile_complete,
                     "profile_evidence": (profile or {}).get("evidence", []),
                     "schedule_refs": (profile or {}).get("schedule_refs", []),
+                    "source_history_operational_fields": bool(
+                        clean_text(row.get("작업날짜")) and clean_text(row.get("작업 조"))
+                    ),
                 },
             )
         )
@@ -1172,6 +1191,7 @@ def worker_candidates(
                         "starred": article.starred,
                         "similar": article.similar,
                         "body_title": article.body_title,
+                        "body_content_count": article.body_content_count,
                         "profile_complete": profile_complete,
                         "profile_evidence": (profile or {}).get("evidence", []),
                         "schedule_refs": (profile or {}).get("schedule_refs", []),
@@ -1268,6 +1288,85 @@ def apply_latest_aggregate_categories(
         latest_key = normalize_key(latest_category)
         if current_key and latest_key and (current_key in latest_key or latest_key in current_key):
             article.category = latest_category
+
+
+def source_history_has_operational_fields(candidates: list[Candidate]) -> bool:
+    """Return whether the selected source snapshot carries current work metadata."""
+    return any(
+        bool(candidate.extra.get("source_history_operational_fields"))
+        for candidate in candidates
+    )
+
+
+def adjacent_compound_category_labels(
+    final_categories: list[str],
+    aggregate_front_categories: list[str],
+) -> dict[str, str]:
+    """Map adjacent final categories to an explicit aggregate-front compound label.
+
+    This is deliberately data-driven: the returned spelling and separator come
+    from a supplied workfile's front-page category table, never from a built-in
+    category dictionary.
+    """
+    ordered_final = list(dict.fromkeys(clean_text(value) for value in final_categories if clean_text(value)))
+    labels = [clean_text(value) for value in aggregate_front_categories if clean_text(value)]
+    mappings: dict[str, str] = {}
+    for left, right in zip(ordered_final, ordered_final[1:]):
+        combined_key = f"{normalize_key(left)}{normalize_key(right)}"
+        if not combined_key:
+            continue
+        matches = [
+            label for label in labels
+            if normalize_key(label) == combined_key
+            and normalize_key(label) not in {normalize_key(left), normalize_key(right)}
+        ]
+        if len(set(matches)) == 1:
+            mappings[normalize_key(left)] = matches[0]
+    return mappings
+
+
+def apply_aggregate_front_category_labels(
+    articles: list[Article],
+    candidates: list[Candidate],
+) -> None:
+    """Adopt compound category labels explicitly printed by aggregate workfiles."""
+    aggregate_kinds = {"morning_aggregate", "afternoon_aggregate", "late_morning_aggregate"}
+    sources: dict[str, tuple[int, int]] = {}
+    for candidate in candidates:
+        source_kind = clean_text(candidate.extra.get("source_kind"))
+        source_file = clean_text(candidate.source_file)
+        if source_kind not in aggregate_kinds or not source_file:
+            continue
+        stage_rank = 1 if clean_text(candidate.extra.get("comparison_stage")) == "afternoon" else 0
+        sources[source_file] = max(
+            sources.get(source_file, (-1, -1)),
+            (workfile_revision_rank(source_file), stage_rank),
+        )
+
+    ranked_labels: list[tuple[tuple[int, int], str]] = []
+    for source_file, (revision, stage_rank) in sources.items():
+        path = Path(source_file)
+        if not path.exists():
+            continue
+        try:
+            categories = front_category_sequence(front_entries(extract_paragraphs(path)))
+        except (OSError, ValueError, zipfile.BadZipFile):
+            continue
+        source_rank = (revision, stage_rank)
+        ranked_labels.extend((source_rank, category) for category in categories)
+
+    if not ranked_labels:
+        return
+    best_rank = max(rank for rank, _ in ranked_labels)
+    best_labels = [label for rank, label in ranked_labels if rank == best_rank]
+    mappings = adjacent_compound_category_labels(
+        [article.category for article in articles],
+        best_labels,
+    )
+    for article in articles:
+        replacement = mappings.get(normalize_key(article.category))
+        if replacement:
+            article.category = replacement
 
 
 def align_group_child_titles(articles: list[Article]) -> None:
@@ -1441,6 +1540,7 @@ def japan_candidates(
                                 "profile_complete": profile_complete,
                                 "profile_evidence": (profile or {}).get("evidence", []),
                                 "schedule_refs": (profile or {}).get("schedule_refs", []),
+                                "body_content_count": 0,
                             },
                         )
                     )
@@ -1469,6 +1569,7 @@ def japan_candidates(
                             "profile_complete": profile_complete,
                             "profile_evidence": (profile or {}).get("evidence", []),
                             "schedule_refs": (profile or {}).get("schedule_refs", []),
+                            "body_content_count": article.body_content_count,
                         },
                     )
                 )
@@ -1484,6 +1585,137 @@ def candidate_score(article: Article, candidate: Candidate) -> float:
     media_score = media_similarity(article.media, candidate.media)
     date_score = 1.0 if article.date and candidate.date and normalize_key(article.date) == normalize_key(candidate.date) else 0.0
     return min(1.0, 0.88 * title_score + 0.08 * media_score + 0.04 * date_score)
+
+
+def candidate_identity_matches(article: Article, candidate: Candidate) -> bool:
+    """Require exact title identity plus compatible outlet and non-conflicting date."""
+    exact_title = normalize_key(candidate.title) in {
+        normalize_key(title) for title in article.match_titles
+    }
+    if not exact_title or media_similarity(article.media, candidate.media) < 0.85:
+        return False
+    article_date = parse_date(article.date)
+    candidate_date = parse_date(candidate.date)
+    return not (article_date and candidate_date and article_date != candidate_date)
+
+
+def reference_candidates_for_article(
+    article: Article,
+    candidates: list[Candidate],
+) -> list[Candidate]:
+    """Keep compatible outlets plus exact title/date translated-outlet evidence."""
+    article_date = parse_date(article.date)
+    exact_titles = {
+        normalize_key(title) for title in article.match_titles if normalize_key(title)
+    }
+    return [
+        candidate
+        for candidate in candidates
+        if (
+            media_similarity(article.media, candidate.media) >= 0.85
+            or (
+                article_date is not None
+                and parse_date(candidate.date) == article_date
+                and normalize_key(candidate.title) in exact_titles
+            )
+        )
+    ]
+
+
+def regular_reference_covers_explicit_similar_variant(
+    regular: Candidate,
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> bool:
+    """Detect a regular-history title explicitly retained as a similar row."""
+    probe = candidate_as_article(regular)
+    return any(
+        candidate.extra.get("similar", False)
+        and clean_text(candidate.extra.get("source_kind")) in {
+            "afternoon_aggregate", "morning_aggregate"
+        }
+        and media_similarity(regular.media, candidate.media) >= 0.85
+        and candidate_score(probe, candidate) >= matching["auto_threshold"]
+        for candidate in worker_candidates
+    )
+
+
+def explicit_similar_cluster_regular(
+    article: Article,
+    regular_candidates: list[Candidate],
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> tuple[float, Candidate] | None:
+    """Recover the regular representative of an explicit variant cluster.
+
+    A final representative can be retitled while the latest aggregate retains
+    the exact regular-history wording as its explicit similar row. That second,
+    independent occurrence identifies the earlier regular inflow even when the
+    representative title alone falls just below the ordinary review threshold.
+    """
+    covered = [
+        candidate
+        for candidate in regular_candidates
+        if regular_reference_covers_explicit_similar_variant(
+            candidate,
+            worker_candidates,
+            matching,
+        )
+    ]
+    ranked = ranked_matches(article, covered)
+    if not ranked or ranked[0][0] < matching["review_threshold"] * 0.8:
+        return None
+    if (
+        len(ranked) > 1
+        and ranked[0][0] - ranked[1][0] < matching["ambiguity_margin"]
+    ):
+        return None
+    return ranked[0]
+
+
+def qualify_current_schema_draft_conflict(
+    article: Article,
+    candidate: Candidate,
+    regular_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> Candidate:
+    """Use a stage-qualified owner only for a resolved current-schema conflict."""
+    if (
+        clean_text(candidate.extra.get("source_kind")) not in INITIAL_DRAFT_SOURCE_KINDS
+        or candidate.extra.get("lineage_inferred_from_aggregate")
+        or not source_history_has_operational_fields(regular_candidates)
+        or not candidate.owner
+        or "/" in candidate.owner
+        or not (
+            candidate_identity_matches(article, candidate)
+            or (
+                article.similar
+                and any(
+                    normalize_key(regular.title)
+                    in {
+                        normalize_key(title)
+                        for title in article.match_titles
+                        if normalize_key(title)
+                    }
+                    for regular in regular_candidates
+                )
+            )
+        )
+        or not any(
+            candidate_score(article, regular) >= matching["auto_threshold"]
+            for regular in regular_candidates
+        )
+    ):
+        return candidate
+    stage = {
+        "afternoon": "오후",
+        "morning": "오전",
+    }.get(clean_text(candidate.extra.get("comparison_stage")), "오후")
+    return replace(
+        candidate,
+        owner=f"{stage}/{candidate.owner}",
+        extra={**candidate.extra, "stage_qualified_reference_conflict": True},
+    )
 
 
 def ranked_matches(article: Article, candidates: list[Candidate]) -> list[tuple[float, Candidate]]:
@@ -1525,6 +1757,16 @@ def unique_rewritten_trend_duplicate(
     and date plus meaningful residual title overlap, and a later aggregate
     independently carries the final title at the automatic threshold.
     """
+    if article.similar and not article.raw_heading:
+        # Synthetic similar rows recovered from an aggregate are copied rows,
+        # not final-report evidence of a uniquely rewritten direct draft.
+        return None
+    if not article.similar and any(
+        candidate_identity_matches(article, candidate)
+        for candidate in regular_candidates
+    ):
+        # An exact regular representative is not a rewritten trend lineage.
+        return None
     if not ranked_origin_matches(
         article,
         regular_candidates,
@@ -1535,6 +1777,8 @@ def unique_rewritten_trend_duplicate(
         candidate
         for candidate in worker_candidates
         if clean_text(candidate.extra.get("source_kind")) in INITIAL_DRAFT_SOURCE_KINDS
+        and not candidate.extra.get("similar", False)
+        and int(candidate.extra.get("body_content_count", 0)) > 0
     ]
     residual_threshold = matching["review_threshold"] * 0.8
     compatible: list[tuple[float, Candidate]] = []
@@ -1577,10 +1821,10 @@ def enrich_special_source_roles(
     eligible_workers = [
         item for item in worker_candidates if item.extra.get("profile_complete", False)
     ]
-    file_scores: list[tuple[int, float, int, str, Candidate]] = []
+    file_scores: list[dict[str, Any]] = []
     for source_file in dict.fromkeys(item.source_file for item in eligible_workers):
         current = [item for item in eligible_workers if item.source_file == source_file]
-        matched_scores: list[float] = []
+        matched_scores: dict[int, float] = {}
         for candidate in candidates:
             probe = Article(
                 source_file=candidate.source_file,
@@ -1593,25 +1837,52 @@ def enrich_special_source_roles(
             )
             ranked = ranked_matches(probe, current)
             if ranked and ranked[0][0] >= matching["review_threshold"]:
-                matched_scores.append(ranked[0][0])
+                matched_scores[id(candidate)] = ranked[0][0]
         if matched_scores:
             representative = current[0]
             stage = clean_text(representative.extra.get("comparison_stage"))
-            stage_order = 1 if stage == "afternoon" else 0
-            file_scores.append((
-                len(matched_scores),
-                sum(matched_scores) / len(matched_scores),
-                stage_order,
-                source_file,
-                representative,
-            ))
-    selected: Candidate | None = None
-    selected_stage = ""
-    selected_score = 0.0
-    coverage = 0
-    if file_scores:
-        coverage, selected_score, _, _, selected = max(file_scores, key=lambda item: item[:3])
-        selected_stage = clean_text(selected.extra.get("comparison_stage"))
+            file_scores.append({
+                "coverage": len(matched_scores),
+                "average": sum(matched_scores.values()) / len(matched_scores),
+                "stage_order": 1 if stage == "afternoon" else 0,
+                "source_file": source_file,
+                "representative": representative,
+                "matches": matched_scores,
+                "source_kind": clean_text(representative.extra.get("source_kind")),
+            })
+
+    def record_key(record: dict[str, Any]) -> tuple[int, float, int]:
+        return record["coverage"], record["average"], record["stage_order"]
+
+    selected_record = max(file_scores, key=record_key) if file_scores else None
+    aggregate_kinds = {"afternoon_aggregate", "morning_aggregate", "late_morning_aggregate"}
+    aggregate_records = [record for record in file_scores if record["source_kind"] in aggregate_kinds]
+    auxiliary_records = [record for record in file_scores if record["source_kind"] == "morning_auxiliary"]
+    best_aggregate = max(aggregate_records, key=record_key) if aggregate_records else None
+    best_auxiliary = max(auxiliary_records, key=record_key) if auxiliary_records else None
+
+    selected_by_candidate: dict[int, dict[str, Any]] = {}
+    if selected_record:
+        selected_by_candidate = {id(candidate): selected_record for candidate in candidates}
+    if (
+        best_aggregate
+        and best_auxiliary
+        and best_aggregate["coverage"] > best_auxiliary["coverage"]
+        and len(candidates) > 1
+        and best_auxiliary["coverage"] == len(candidates) - 1
+    ):
+        # A nearly complete auxiliary packet can contain the substantive work for
+        # only part of a Japan bundle. Preserve that article-level contribution,
+        # while the aggregate editor remains responsible for heading-only or
+        # uncovered items.
+        for candidate in candidates:
+            if (
+                int(candidate.extra.get("body_content_count", 0)) > 0
+                and id(candidate) in best_auxiliary["matches"]
+            ):
+                selected_by_candidate[id(candidate)] = best_auxiliary
+            else:
+                selected_by_candidate[id(candidate)] = best_aggregate
 
     enriched: list[Candidate] = []
     for candidate in candidates:
@@ -1630,9 +1901,14 @@ def enrich_special_source_roles(
         ):
             enriched.append(candidate)
             continue
+        record = selected_by_candidate.get(id(candidate))
+        selected = record["representative"] if record else None
         if selected is None:
             enriched.append(candidate)
             continue
+        coverage = int(record["coverage"])
+        selected_score = float(record["average"])
+        selected_stage = clean_text(selected.extra.get("comparison_stage"))
         refs = list(selected.extra.get("schedule_refs", []))
         selected_source_kind = clean_text(selected.extra.get("source_kind"))
         evidence = list(candidate.extra.get("profile_evidence", []))
@@ -1737,6 +2013,29 @@ def unique_rewritten_regular_before_copied_workfile(
     if not automatic_copied_workfile:
         return None
 
+    if not article.date:
+        exact_title = {
+            normalize_key(title) for title in article.match_titles if normalize_key(title)
+        }
+        exact_regular = [
+            candidate
+            for candidate in regular_candidates
+            if normalize_key(candidate.title) in exact_title
+        ]
+        if len(exact_regular) == 1:
+            return candidate_score(article, exact_regular[0]), exact_regular[0]
+        ranked_undated = ranked_matches(article, regular_candidates)
+        if (
+            ranked_undated
+            and ranked_undated[0][0] >= matching["auto_threshold"]
+            and (
+                len(ranked_undated) == 1
+                or ranked_undated[0][0] - ranked_undated[1][0]
+                >= matching["ambiguity_margin"]
+            )
+        ):
+            return ranked_undated[0]
+
     same_date = [
         candidate
         for candidate in regular_candidates
@@ -1832,8 +2131,13 @@ def choose_origin(
     chosen_ranked: list[tuple[float, Candidate]] = []
     ranked_by_source: dict[str, list[tuple[float, Candidate]]] = {}
     for source_type, candidates in pools.items():
-        score_ranked = ranked_matches(article, candidates)
-        ranked = ranked_origin_matches(article, candidates, matching["review_threshold"])
+        origin_candidates = (
+            reference_candidates_for_article(article, candidates)
+            if source_type in REFERENCE_SOURCE_ORDER
+            else candidates
+        )
+        score_ranked = ranked_matches(article, origin_candidates)
+        ranked = ranked_origin_matches(article, origin_candidates, matching["review_threshold"])
         ranked_by_source[source_type] = ranked
         best_scores[source_type] = round(score_ranked[0][0], 4) if score_ranked else 0.0
 
@@ -1877,31 +2181,35 @@ def choose_origin(
         workers,
         matching,
     )
+    clustered_regular = explicit_similar_cluster_regular(
+        article,
+        pools.get("regular", []),
+        workers,
+        matching,
+    )
     rewritten_reference_selected = False
     rewritten_trend_selected = False
 
-    # An individual domestic/global trend draft is direct article-level
-    # provenance. When it automatically matches a duplicate regular-history
-    # item, the human workflow credits the trend draft. Aggregates and other
-    # copied workfiles do not receive this override. A strong Japan source keeps
-    # its special-source treatment. Below the automatic threshold, the prior
-    # materially-stronger safeguards still apply.
+    # Reference history is first in the workflow, but an exact current draft can
+    # still establish provenance when the reference title is only a different
+    # story variant. A regular title explicitly retained as a similar row covers
+    # the whole variant cluster and keeps reference precedence.
     reference_choice: tuple[float, Candidate] | None = None
     for source_type in REFERENCE_SOURCE_ORDER:
         ranked = ranked_by_source.get(source_type, [])
         if ranked:
             reference_choice = ranked[0]
             break
+    regular_variant_cluster = bool(
+        clustered_regular is not None
+        and not article.similar
+        and (
+            reference_choice is None
+            or reference_choice[1] is clustered_regular[1]
+        )
+    )
     if ranked_initial_drafts:
         initial_score, initial_candidate = ranked_initial_drafts[0]
-        automatic_regular_duplicate = bool(
-            ranked_by_source.get("regular")
-            and initial_score >= matching["auto_threshold"]
-            and not (
-                ranked_by_source.get("japan")
-                and ranked_by_source["japan"][0][0] >= matching["auto_threshold"]
-            )
-        )
         reference_score = (
             reference_choice[0]
             if reference_choice
@@ -1910,9 +2218,14 @@ def choose_origin(
                 default=0.0,
             )
         )
+        reference_candidate = reference_choice[1] if reference_choice else None
+        direct_identity = candidate_identity_matches(article, initial_candidate)
+        reference_identity = bool(
+            reference_candidate
+            and candidate_identity_matches(article, reference_candidate)
+        )
         draft_preferred = bool(
-            automatic_regular_duplicate
-            or (
+            (
                 reference_choice is None
                 and initial_score - reference_score >= matching["ambiguity_margin"]
             )
@@ -1922,22 +2235,47 @@ def choose_origin(
                 and initial_score >= matching["auto_threshold"]
                 and initial_score - reference_score >= matching["ambiguity_margin"]
             )
+            or (
+                reference_candidate is not None
+                and reference_candidate.source_type == "regular"
+                and direct_identity
+                and not reference_identity
+                and not regular_variant_cluster
+            )
         )
         if draft_preferred:
-            chosen_ranked = ranked_initial_drafts
-            chosen_score, chosen = initial_score, initial_candidate
+            chosen_score = initial_score
+            chosen = qualify_current_schema_draft_conflict(
+                article,
+                initial_candidate,
+                pools.get("regular", []),
+                matching,
+            )
+            chosen_ranked = [(chosen_score, chosen), *ranked_initial_drafts[1:]]
             chosen_stage = clean_text(initial_candidate.extra.get("comparison_stage")) or "afternoon"
+
+    if clustered_regular is not None and reference_choice is None:
+        chosen_score, chosen = clustered_regular
+        chosen_ranked = [clustered_regular]
+        chosen_stage = "reference"
 
     if (
         chosen is None
         and rewritten_trend is not None
+        and not regular_variant_cluster
         and not (
             ranked_by_source.get("japan")
             and ranked_by_source["japan"][0][0] >= matching["auto_threshold"]
         )
     ):
-        chosen_score, chosen = rewritten_trend
-        chosen_ranked = [rewritten_trend]
+        chosen_score, rewritten_candidate = rewritten_trend
+        chosen = qualify_current_schema_draft_conflict(
+            article,
+            rewritten_candidate,
+            pools.get("regular", []),
+            matching,
+        )
+        chosen_ranked = [(chosen_score, chosen)]
         chosen_stage = clean_text(chosen.extra.get("comparison_stage")) or "afternoon"
         rewritten_trend_selected = True
 
@@ -2423,7 +2761,13 @@ def omitted_worker_candidates(
             )
         )
     ]
-    unmatched.sort(key=lambda item: int(item.extra.get("priority", 0)), reverse=True)
+    stage_order = {"afternoon": 0, "morning": 1}
+    unmatched.sort(
+        key=lambda item: (
+            stage_order.get(clean_text(item.extra.get("comparison_stage")), 2),
+            -int(item.extra.get("priority", 0)),
+        )
+    )
     unique: list[Candidate] = []
     for candidate in unmatched:
         duplicate = any(
@@ -2500,6 +2844,25 @@ def closest_current_category(
         ):
             return category, True
     return raw, False
+
+
+def omitted_candidate_category(
+    candidate: Candidate,
+    final_articles: list[Article],
+    matching: dict[str, float],
+) -> tuple[str, bool]:
+    """Map a reliable current label, otherwise preserve the explicit source label."""
+    raw = clean_text(candidate.extra.get("category"))
+    category, mapped = closest_current_category(
+        raw,
+        final_articles,
+        matching["review_threshold"],
+        candidate,
+        matching["ambiguity_margin"],
+    )
+    if raw and not mapped:
+        return raw, True
+    return category, mapped
 
 
 def automatic_similar_additions(
@@ -2623,10 +2986,15 @@ def late_morning_aggregate_origin(
     ]
     if ranked_origin_matches(article, earlier_sources, matching["review_threshold"]):
         return origin
+    owner = (
+        "오전/총괄"
+        if source_history_has_operational_fields(pools.get("regular", []))
+        else "오후/총괄"
+    )
     return replace(
         origin,
         workgroup="1조",
-        owner="오후/총괄",
+        owner=owner,
         extra={**origin.extra, "source_kind": "late_morning_aggregate"},
     )
 
@@ -3137,6 +3505,7 @@ def main() -> int:
         config["matching"]["review_threshold"],
         config["matching"]["auto_threshold"],
     )
+    apply_aggregate_front_category_labels(final_articles, workers)
     japan, japan_warnings = japan_candidates(
         japan_path,
         source_profiles.get("japan"),
@@ -3464,12 +3833,10 @@ def main() -> int:
     ]
     for offset, candidate in enumerate(omitted, start=1):
         order = len(final_articles) + offset
-        category, category_mapped = closest_current_category(
-            clean_text(candidate.extra.get("category")),
-            final_articles,
-            config["matching"]["review_threshold"],
+        category, category_mapped = omitted_candidate_category(
             candidate,
-            config["matching"]["ambiguity_margin"],
+            final_articles,
+            config["matching"],
         )
         reasons: list[str] = []
         if not category_mapped:
