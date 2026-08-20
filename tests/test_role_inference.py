@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -1106,6 +1107,105 @@ class PublicPackageSafetyTests(unittest.TestCase):
         self.assertTrue(process_job.google_sheets_write_enabled({
             "sync": {"google_sheets_write_enabled": True},
         }))
+
+
+class ArticleScopedContextTests(unittest.TestCase):
+    def test_confirmation_distinguishes_duplicate_orders_by_identity(self):
+        article = process_job.Article(
+            source_file="final.hwpx",
+            order=10,
+            category="경제",
+            media="Second News",
+            date="8.3",
+            body_title="두 번째 기사",
+            canonical_title="두 번째 기사",
+        )
+        confirmations = [
+            {
+                "order": 10,
+                "article_title": "첫 번째 기사",
+                "article_media": "First News",
+                "owner": "국내",
+            },
+            {
+                "order": 10,
+                "reference_title": "두 번째 기사",
+                "reference_media": "Second News",
+                "owner": "오전/총괄",
+            },
+        ]
+
+        selected = process_job.article_scoped_confirmation(confirmations, article)
+
+        self.assertEqual(selected["owner"], "오전/총괄")
+
+    def test_override_targets_one_duplicate_order_by_identity(self):
+        first = process_job.Article(
+            "final.hwpx", 5, "분류", "First News", "8.3", "첫 기사", "첫 기사"
+        )
+        second = process_job.Article(
+            "final.hwpx", 5, "분류", "Second News", "8.3", "둘째 기사", "둘째 기사"
+        )
+        warnings = process_job.apply_article_overrides(
+            [first, second],
+            {
+                "article_overrides": [{
+                    "order": 5,
+                    "article_title": "둘째 기사",
+                    "article_media": "Second News",
+                    "field": "category",
+                    "value": "새 분류",
+                    "evidence": ["현재 원문 대조"],
+                }]
+            },
+        )
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(first.category, "분류")
+        self.assertEqual(second.category, "새 분류")
+
+    def test_authoritative_role_confirmation_is_final_after_origin_rewrite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reference = Path(temp_dir) / "reference.txt"
+            reference.write_text("current reference", encoding="utf-8")
+            automatically_rewritten = process_job.Candidate(
+                "worker",
+                "현재 기사",
+                "현재 매체",
+                "8.12",
+                source_file="morning-second-pass.hwpx",
+                workgroup="1조",
+                owner="오후/총괄",
+                worker="현재 작업자",
+                extra={
+                    "source_kind": "late_morning_aggregate",
+                    "comparison_stage": "morning",
+                    "profile_complete": True,
+                },
+            )
+            confirmed, reasons, applied = process_job.apply_confirmed_article_roles(
+                automatically_rewritten,
+                {
+                    "workgroup": "1조",
+                    "owner": "오전/총괄",
+                    "worker": "현재 작업자",
+                    "evidence": ["같은 작업일 기준표와 현재 원본을 대조함"],
+                    "schedule_refs": ["근무!8"],
+                    "reference_file": str(reference),
+                    "reference_sha256": process_job.sha256_file(reference),
+                },
+                valid_schedule_refs={"근무!8": "현재 작업자"},
+                require_schedule=True,
+            )
+
+        self.assertTrue(applied)
+        self.assertEqual(reasons, [])
+        self.assertEqual(
+            (confirmed.workgroup, confirmed.owner, confirmed.worker),
+            ("1조", "오전/총괄", "현재 작업자"),
+        )
+        self.assertEqual(confirmed.extra["source_kind"], "late_morning_aggregate")
+        self.assertTrue(confirmed.extra["role_confirmed_from_reference"])
 
 
 if __name__ == "__main__":

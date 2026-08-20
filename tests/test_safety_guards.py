@@ -581,5 +581,98 @@ class SafetyGuardTests(unittest.TestCase):
             sheet_sync_guard.preflight(args)
 
 
+class ReferenceFeedbackRegressionTests(unittest.TestCase):
+    def test_source_history_accepts_empty_trailing_grid_chunk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.json"
+            output = Path(temp_dir) / "output.json"
+            source.write_text(json.dumps({
+                "chunks": [
+                    {
+                        "range": "'1. 작업 내역'!A1:O3333",
+                        "values": [
+                            ["작업날짜", "작업 조", "보도일", "제목 (한글)"],
+                            ["2026. 7. 22", "1조", "2026. 7. 22", "현재 기사"],
+                        ],
+                    },
+                    {"range": "'1. 작업 내역'!A3334:O4780", "values": []},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(sys, "argv", [
+                "prepare_source_history.py", "--input", str(source),
+                "--target-date", "2026-07-22", "--spreadsheet-id", "current",
+                "--sheet-name", "1. 작업 내역", "--output", str(output),
+            ]):
+                self.assertEqual(0, prepare_source_history.main())
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["source_audit"]["scanned_row_count"], 1)
+        self.assertEqual(
+            payload["source_audit"]["scan_ranges"],
+            ["'1. 작업 내역'!A1:O3333", "'1. 작업 내역'!A3334:O4780"],
+        )
+
+    def test_merge_preserves_distinct_articles_with_one_order(self):
+        generated = [
+            {"order": 10, "article_title": "첫 기사", "article_media": "First News"},
+            {"order": 10, "article_title": "둘째 기사", "article_media": "Second News"},
+        ]
+
+        merged = reference_feedback.merge_by_order([], generated)
+
+        self.assertEqual(len(merged), 2)
+        self.assertEqual({item["article_title"] for item in merged}, {"첫 기사", "둘째 기사"})
+
+    def test_consumes_existing_omitted_row_without_duplicate_addition(self):
+        row = [
+            "2026년 08월", "8월 4일", "1조", "국내", "작업자",
+            "오전/총괄", "", "경제", "Example News", "8.3",
+            "이미 작업본에 있던 미포함 기사", "X", "X", "", "",
+        ]
+        references = [list(row)]
+        unused = {0}
+        matches = []
+
+        consumed = reference_feedback.consume_existing_omitted_reference(
+            row,
+            {"order": 99, "omitted_from_final": True},
+            references,
+            unused,
+            matches,
+        )
+
+        self.assertEqual(consumed, 0)
+        self.assertEqual(unused, set())
+        self.assertTrue(matches[0]["existing_omitted"])
+
+    def test_rebuilds_existing_omitted_rows_when_reference_order_differs(self):
+        first = [
+            "2026년 08월", "8월 13일", "1조", "국내", "작업자",
+            "오전/총괄", "", "경제", "First News", "8.12",
+            "첫 번째 미포함 기사", "X", "X", "", "",
+        ]
+        second = [
+            "2026년 08월", "8월 13일", "2조", "보조", "다른 작업자",
+            "오전/총괄", "", "외교", "Second News", "8.12",
+            "두 번째 미포함 기사", "X", "X", "", "",
+        ]
+        unused = {0, 1}
+        matches = []
+
+        consumed = reference_feedback.consume_existing_omitted_rows(
+            [
+                (second, {"order": 99, "omitted_from_final": True}),
+                (first, {"order": 100, "omitted_from_final": True}),
+            ],
+            [first, second],
+            unused,
+            matches,
+        )
+
+        self.assertFalse(consumed)
+        self.assertEqual(unused, {0, 1})
+        self.assertEqual(matches, [])
+
+
 if __name__ == "__main__":
     unittest.main()

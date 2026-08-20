@@ -78,10 +78,104 @@ def best_reference_index(row: list[Any], references: list[list[Any]], unused: se
     return (anchored[0], score) if len(anchored) == 1 else (None, score)
 
 
+IDENTITY_FIELDS = ("article_title", "article_media", "reference_title", "reference_media")
+
+
+def article_identity_fields(row: list[Any], reference: list[Any]) -> dict[str, str]:
+    """Bind a judgment to an article even when several rows share one order."""
+    return {
+        "article_title": clean_text(row[10]),
+        "article_media": clean_text(row[8]),
+        "reference_title": clean_text(reference[10]),
+        "reference_media": clean_text(reference[8]),
+    }
+
+
+def context_item_identity(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        item.get("order"),
+        *(normalize_key(item.get(field)) for field in IDENTITY_FIELDS),
+    )
+
+
 def merge_by_order(existing: list[dict[str, Any]], generated: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    replacements = {item["order"]: item for item in generated}
-    kept = [item for item in existing if item.get("order") not in replacements]
-    return sorted([*kept, *generated], key=lambda item: int(item["order"]))
+    """Merge article judgments without collapsing distinct rows with one order."""
+    generated_keys = {context_item_identity(item) for item in generated}
+    generated_orders = {item.get("order") for item in generated}
+    kept = []
+    for item in existing:
+        has_identity = any(clean_text(item.get(field)) for field in IDENTITY_FIELDS)
+        if context_item_identity(item) in generated_keys:
+            continue
+        if not has_identity and item.get("order") in generated_orders:
+            # Replace an older order-only judgment with current article-scoped ones.
+            continue
+        kept.append(item)
+    return sorted(
+        [*kept, *generated],
+        key=lambda item: (int(item["order"]), *context_item_identity(item)[1:]),
+    )
+
+
+def consume_existing_omitted_reference(
+    row: list[Any],
+    detail: dict[str, Any],
+    references: list[list[Any]],
+    unused: set[int],
+    matches: list[dict[str, Any]],
+) -> int | None:
+    """Consume an omitted row already emitted from current inputs.
+
+    These rows are not ordinary final-article matches and must not affect result
+    ordering, but leaving their reference rows unused would create duplicate
+    confirmed additions at the end of the result.
+    """
+    reference_index, score = best_reference_index(row, references, unused)
+    if reference_index is None:
+        return None
+    unused.remove(reference_index)
+    matches.append(
+        {
+            "order": detail.get("order"),
+            "result_title": clean_text(row[10]),
+            "reference_row": reference_index + 2,
+            "reference_title": clean_text(references[reference_index][10]),
+            "score": round(score, 4),
+            "existing_omitted": True,
+        }
+    )
+    return reference_index
+
+
+def consume_existing_omitted_rows(
+    rows_and_details: list[tuple[list[Any], dict[str, Any]]],
+    references: list[list[Any]],
+    unused: set[int],
+    matches: list[dict[str, Any]],
+) -> bool:
+    """Keep automatic omitted rows only when their complete order is authoritative."""
+    if not rows_and_details:
+        return True
+    proposed_unused = set(unused)
+    proposed_matches: list[dict[str, Any]] = []
+    reference_indices: list[int] = []
+    for row, detail in rows_and_details:
+        reference_index = consume_existing_omitted_reference(
+            row,
+            detail,
+            references,
+            proposed_unused,
+            proposed_matches,
+        )
+        if reference_index is None:
+            return False
+        reference_indices.append(reference_index)
+    if reference_indices != sorted(reference_indices):
+        return False
+    unused.clear()
+    unused.update(proposed_unused)
+    matches.extend(proposed_matches)
+    return True
 
 
 def current_source_articles(context: dict[str, Any], source_json: Path) -> list[dict[str, Any]]:
@@ -354,9 +448,11 @@ def main() -> int:
     profile_votes: dict[tuple[str, str], list[tuple[str, str, str, str, int]]] = defaultdict(list)
     final_votes: list[tuple[str, str, str, int]] = []
     disposition_votes: list[tuple[str, int]] = []
+    existing_omitted_rows: list[tuple[list[Any], dict[str, Any]]] = []
 
     for row, detail in zip(result.get("rows", []), result.get("matches", [])):
         if detail.get("omitted_from_final"):
+            existing_omitted_rows.append((row, detail))
             continue
         if detail.get("confirmed_addition"):
             reference_index, score = best_reference_index(row, references, unused)
@@ -378,6 +474,7 @@ def main() -> int:
             continue
         unused.remove(reference_index)
         reference = references[reference_index]
+        identity = article_identity_fields(row, reference)
         worker = clean_text(reference[4])
         schedule_ref = worker_refs.get(worker)
         evidence = [f"같은 작업일 권위 기준표 {reference_index + 2}행과 현재 결과·원본을 대조"]
@@ -396,6 +493,7 @@ def main() -> int:
             )
         japan_confirmation = {
             "order": order,
+            **identity,
             "included": expected_japan,
             "reference_file": str(reference_file),
             "reference_sha256": reference_hash,
@@ -416,6 +514,7 @@ def main() -> int:
             role_confirmations.append(
                 {
                     "order": order,
+                    **identity,
                     "workgroup": clean_text(reference[2]),
                     "owner": clean_text(reference[3]),
                     "worker": worker,
@@ -443,6 +542,7 @@ def main() -> int:
             origin_confirmations.append(
                 {
                     "order": order,
+                    **identity,
                     "source_type": clean_text(resolved_origin.get("source_type")),
                     "source_file": clean_text(resolved_origin.get("source_file")),
                     "source_title": clean_text(resolved_origin.get("source_title")),
@@ -458,6 +558,7 @@ def main() -> int:
                 overrides.append(
                     {
                         "order": order,
+                        **identity,
                         "field": field_name,
                         "value": expected,
                         "evidence": evidence,
@@ -474,6 +575,13 @@ def main() -> int:
         )
         matched_orders.append((reference_index, order))
 
+    consume_existing_omitted_rows(
+        existing_omitted_rows,
+        references,
+        unused,
+        matches,
+    )
+
     context["article_role_confirmations"] = merge_by_order(
         context.get("article_role_confirmations", []),
         role_confirmations,
@@ -486,11 +594,28 @@ def main() -> int:
         context.get("article_japan_confirmations", []),
         japan_confirmations,
     )
-    replaced_override_keys = {(item["order"], item["field"]) for item in overrides}
+    replaced_override_keys = {
+        (item["order"], item["field"], *context_item_identity(item)[1:])
+        for item in overrides
+    }
+    generated_override_orders = {
+        (item["order"], item["field"])
+        for item in overrides
+    }
     context["article_overrides"] = [
         item
         for item in context.get("article_overrides", [])
-        if (item.get("order"), item.get("field")) not in replaced_override_keys
+        if (
+            (
+                item.get("order"),
+                item.get("field"),
+                *context_item_identity(item)[1:],
+            ) not in replaced_override_keys
+            and not (
+                not any(clean_text(item.get(field)) for field in IDENTITY_FIELDS)
+                and (item.get("order"), item.get("field")) in generated_override_orders
+            )
+        )
     ] + overrides
     if len(matched_orders) == len(result.get("articles", [])):
         context["result_order"] = {

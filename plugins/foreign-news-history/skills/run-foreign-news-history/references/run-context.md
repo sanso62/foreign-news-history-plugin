@@ -77,14 +77,18 @@
     }
   ],
   "article_overrides": [
-    {"order": 1, "field": "category|media|canonical_title", "value": "문서 원문", "evidence": ["근거"]}
+    {"order": 1, "article_title": "현재 결과 제목", "article_media": "현재 결과 매체", "reference_title": "기준표 제목", "reference_media": "기준표 매체", "field": "category|media|canonical_title", "value": "문서 원문", "evidence": ["근거"]}
   ],
   "article_origin_confirmations": [
-    {"order": 1, "source_type": "regular|worker|japan", "source_file": "선택 입력", "source_title": "현재 원본 제목", "evidence": ["낮은 점수나 경합을 직접 확인한 근거"]}
+    {"order": 1, "article_title": "현재 결과 제목", "article_media": "현재 결과 매체", "reference_title": "기준표 제목", "reference_media": "기준표 매체", "source_type": "regular|worker|japan", "source_file": "선택 입력", "source_title": "현재 원본 제목", "evidence": ["낮은 점수나 경합을 직접 확인한 근거"]}
   ],
   "article_role_confirmations": [
     {
       "order": 1,
+      "article_title": "현재 결과 제목",
+      "article_media": "현재 결과 매체",
+      "reference_title": "기준표 제목",
+      "reference_media": "기준표 매체",
       "workgroup": "현재 기준표와 당일 근거로 확인한 값",
       "owner": "현재 기준표와 당일 근거로 확인한 값",
       "worker": "현재 당일 작업자",
@@ -117,8 +121,8 @@
     "evidence": ["기준표의 기사 행 순서와 현재 최종 기사를 제목·매체로 대조한 근거"]
   },
   "article_japan_confirmations": [
-    {"order": 1, "included": true, "source_file": "현재 일본언론동향 원본", "source_title": "원본의 정확한 제목", "reference_file": "같은 작업일 기준 파일", "reference_sha256": "기준 파일 SHA-256", "evidence": ["제목이 크게 달라진 동일 기사를 현재 원문과 기준표로 대조한 근거"]},
-    {"order": 2, "included": false, "reference_file": "같은 작업일 기준 파일", "reference_sha256": "기준 파일 SHA-256", "evidence": ["기준표의 일일일본동향 공란과 현재 원본을 대조한 근거"]}
+    {"order": 1, "article_title": "현재 결과 제목", "article_media": "현재 결과 매체", "reference_title": "기준표 제목", "reference_media": "기준표 매체", "included": true, "source_file": "현재 일본언론동향 원본", "source_title": "원본의 정확한 제목", "reference_file": "같은 작업일 기준 파일", "reference_sha256": "기준 파일 SHA-256", "evidence": ["제목이 크게 달라진 동일 기사를 현재 원문과 기준표로 대조한 근거"]},
+    {"order": 2, "article_title": "현재 결과 제목", "article_media": "현재 결과 매체", "reference_title": "기준표 제목", "reference_media": "기준표 매체", "included": false, "reference_file": "같은 작업일 기준 파일", "reference_sha256": "기준 파일 SHA-256", "evidence": ["기준표의 일일일본동향 공란과 현재 원본을 대조한 근거"]}
   ]
 }
 ```
@@ -147,7 +151,9 @@
 - 문서 표기가 불명확하면 `article_overrides`에 임의 표기를 만들지 않는다.
 - 자동 매칭 점수가 낮거나 후보가 경합해 Codex가 현재 원문을 직접 대조한 경우에만 `article_origin_confirmations`를 기록한다. 과거 실행의 확인값은 재사용하지 않는다.
 - 현재 입력 파일만으로 역할을 복원할 수 없지만 사용자가 같은 작업일의 권위 있는 기준표를 제공한 경우에만 `article_role_confirmations`를 사용한다. 기준 파일 절대 경로와 SHA-256, 당일 `schedule_refs`, 구체적 행 근거가 모두 필요하다. 이 확인값은 다른 날짜나 기준 파일에 승계하지 않는다.
+- 같은 `order`를 공유하는 대표·유사 기사에는 `article_title`·`article_media`와 기준표의 `reference_title`·`reference_media`를 함께 기록한다. 기사별 확인값과 덮어쓰기는 순번만으로 합치거나 적용하지 않는다.
 - 자동 추출 결과에 없는 유사보도나 완전 미포함 행을 사용자가 같은 작업일의 권위 있는 기준표로 확인한 경우에만 `article_additions`를 사용한다. 현재 후보의 유입 경로·정확한 제목, 기준 파일 절대 경로·SHA-256, 분류와 삽입 위치, 구체적 행 근거가 모두 필요하다. 해시가 바뀌거나 후보를 하나로 특정하지 못하면 적용하지 않는다.
+- 자동 추출된 미포함 행들의 순서가 기준표의 대응 행 순서와 모두 같을 때만 기존 행을 그대로 소비한다. 순서가 다르거나 일부를 특정할 수 없으면 현재 원본 후보에서 `article_additions`를 다시 만들고 기준표 순서로 배치한다.
 - 최종보고서 추출 순서와 같은 작업일 기준표의 기사 행 순서가 다른 경우에만 `result_order`를 사용한다. 현재 최종 기사 `order`의 완전한 순열이어야 하며, 기준 파일 해시가 달라지면 적용하지 않는다.
 - 최종보고서 기사 유입 경로는 최초 유입의 시간 순서인 ① 정기 작업내역·일본언론동향 ② 전일 밤 오후폴더 ③ 당일 새벽 오전폴더 순서로 비교한다. 이 순서는 실행별 판단값이 아니라 휴먼 업무 절차다.
 - 정기와 일본언론동향 양쪽에 모두 있으면 정기 경로를 선택하고 `일일일본동향`은 O로 유지한다.

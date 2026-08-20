@@ -2096,6 +2096,99 @@ def confirmed_article_roles(
     return profile, []
 
 
+def article_context_identity_score(item: dict[str, Any], article: Article) -> int:
+    """Score an article-scoped context item without relying on a unique order."""
+    article_titles = {
+        normalize_key(article.canonical_title),
+        normalize_key(article.body_title),
+    } - {""}
+    item_titles = {
+        normalize_key(item.get("article_title")),
+        normalize_key(item.get("reference_title")),
+    } - {""}
+    article_media = normalize_key(article.media)
+    item_media = {
+        normalize_key(item.get("article_media")),
+        normalize_key(item.get("reference_media")),
+    } - {""}
+    score = 0
+    if article_titles and item_titles and article_titles & item_titles:
+        score += 4
+    if article_media and item_media and article_media in item_media:
+        score += 2
+    return score
+
+
+def article_scoped_confirmation(
+    items: list[dict[str, Any]],
+    article: Article,
+    order: int | None = None,
+) -> dict[str, Any] | None:
+    """Select a confirmation by order plus current/reference article identity."""
+    scoped_order = article.order if order is None else order
+    candidates = [item for item in items if item.get("order") == scoped_order]
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    ranked = sorted(
+        (
+            (article_context_identity_score(item, article), index, item)
+            for index, item in enumerate(candidates)
+        ),
+        key=lambda value: (value[0], -value[1]),
+        reverse=True,
+    )
+    if ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0]):
+        return ranked[0][2]
+    if not any(
+        clean_text(item.get(field))
+        for item in candidates
+        for field in ("article_title", "reference_title", "article_media", "reference_media")
+    ):
+        # Backward compatibility for older contexts whose orders were unique.
+        return candidates[0]
+    return None
+
+
+def apply_confirmed_article_roles(
+    origin: Candidate | None,
+    confirmation: dict[str, Any] | None,
+    valid_schedule_refs: dict[str, str] | set[str] | None = None,
+    require_schedule: bool = False,
+) -> tuple[Candidate | None, list[str], bool]:
+    """Apply a hash-bound role confirmation after automatic origin rewrites.
+
+    Automatic provenance rules can replace the selected candidate (for example,
+    the narrow regular carry-over and late-morning aggregate classifications).
+    A same-run authoritative role confirmation must therefore be the final role
+    transformation, while retaining the automatically selected source candidate.
+    """
+    role_profile, reasons = confirmed_article_roles(
+        confirmation,
+        valid_schedule_refs,
+        require_schedule,
+    )
+    if not role_profile:
+        return origin, reasons, False
+    if not origin:
+        return origin, [*reasons, "기사별 역할 확인값을 적용할 유입 후보가 없음"], False
+    confirmed_extra = {
+        **origin.extra,
+        "profile_complete": True,
+        "role_confirmed_from_reference": True,
+    }
+    return (
+        replace(
+            origin,
+            workgroup=clean_text(role_profile.get("workgroup")),
+            owner=clean_text(role_profile.get("owner")),
+            worker=clean_text(role_profile.get("worker")),
+            extra=confirmed_extra,
+        ),
+        reasons,
+        True,
+    )
+
+
 def confirmed_article_additions(
     run_context: dict[str, Any],
     pools: dict[str, list[Candidate]],
@@ -2857,13 +2950,35 @@ def apply_article_overrides(
         order = override.get("order")
         field_name = clean_text(override.get("field"))
         value = clean_text(override.get("value"))
-        if not isinstance(order, int) or not 1 <= order <= len(articles) or field_name not in allowed or not value:
+        if not isinstance(order, int) or field_name not in allowed or not value:
             warnings.append(f"잘못된 기사별 실행 컨텍스트 항목: {override}")
             continue
         if not evidence:
             warnings.append(f"근거 없는 기사별 판단을 적용하지 않음: {order}/{field_name}")
             continue
-        setattr(articles[order - 1], field_name, value)
+        candidates = [article for article in articles if article.order == order]
+        if len(candidates) == 1:
+            target = candidates[0]
+        elif len(candidates) > 1:
+            ranked = sorted(
+                (
+                    (article_context_identity_score(override, article), index, article)
+                    for index, article in enumerate(candidates)
+                ),
+                key=lambda item: (item[0], -item[1]),
+                reverse=True,
+            )
+            target = (
+                ranked[0][2]
+                if ranked[0][0] > 0 and (len(ranked) == 1 or ranked[0][0] > ranked[1][0])
+                else None
+            )
+        else:
+            target = articles[order - 1] if 1 <= order <= len(articles) else None
+        if target is None:
+            warnings.append(f"기사별 판단 대상이 순번·제목·매체로 하나로 확정되지 않음: {order}/{field_name}")
+            continue
+        setattr(target, field_name, value)
     return warnings
 
 
@@ -3081,13 +3196,9 @@ def main() -> int:
             origin = lineage_origin
             score = candidate_score(article, lineage_origin)
             reasons = [reason for reason in reasons if not reason.startswith("낮은 매칭 점수")]
-        confirmation = next(
-            (
-                item
-                for item in run_context.get("article_origin_confirmations", [])
-                if item.get("order") == article.order
-            ),
-            None,
+        confirmation = article_scoped_confirmation(
+            run_context.get("article_origin_confirmations", []),
+            article,
         )
         if confirmation:
             confirmed, confirmed_score, confirmation_reasons = confirmed_origin(article, pools, confirmation)
@@ -3096,48 +3207,13 @@ def main() -> int:
                 score = confirmed_score
                 reasons = [] if confirmed.extra.get("profile_complete", False) else ["유입 파일의 작업자·역할 근거 불완전"]
             reasons.extend(confirmation_reasons)
-        role_confirmation = next(
-            (
-                item
-                for item in run_context.get("article_role_confirmations", [])
-                if item.get("order") == article.order
-            ),
-            None,
+        role_confirmation = article_scoped_confirmation(
+            run_context.get("article_role_confirmations", []),
+            article,
         )
-        if role_confirmation:
-            role_profile, role_confirmation_reasons = confirmed_article_roles(
-                role_confirmation,
-                valid_schedule_refs,
-                require_schedule,
-            )
-            if role_profile and origin:
-                confirmed_extra = {
-                    **origin.extra,
-                    "profile_complete": True,
-                    "role_confirmed_from_reference": True,
-                }
-                confirmed_candidate = replace(
-                    origin,
-                    workgroup=clean_text(role_profile.get("workgroup")),
-                    owner=clean_text(role_profile.get("owner")),
-                    worker=clean_text(role_profile.get("worker")),
-                    extra=confirmed_extra,
-                )
-                origin = confirmed_candidate
-                # This confirmation is bound to the current authoritative file
-                # hash.  It resolves first-pass score/ambiguity provenance notes;
-                # later category/final/Japan checks are still added independently.
-                reasons = []
-            elif role_profile and not origin:
-                role_confirmation_reasons.append("기사별 역할 확인값을 적용할 유입 후보가 없음")
-            reasons.extend(role_confirmation_reasons)
-        japan_confirmation = next(
-            (
-                item
-                for item in run_context.get("article_japan_confirmations", [])
-                if item.get("order") == article.order
-            ),
-            None,
+        japan_confirmation = article_scoped_confirmation(
+            run_context.get("article_japan_confirmations", []),
+            article,
         )
         japan_match, japan_score, japan_reasons = japan_membership(
             article,
@@ -3187,6 +3263,21 @@ def main() -> int:
             config["matching"],
             target_date,
         )
+        if role_confirmation:
+            origin, role_confirmation_reasons, role_confirmation_applied = (
+                apply_confirmed_article_roles(
+                    origin,
+                    role_confirmation,
+                    valid_schedule_refs,
+                    require_schedule,
+                )
+            )
+            if role_confirmation_applied:
+                # The confirmation is bound to the current authoritative file
+                # hash and is deliberately applied after every automatic origin
+                # rewrite. Later category/final/Japan checks remain independent.
+                reasons = []
+            reasons.extend(role_confirmation_reasons)
         japan_value = "O" if japan_match else ""
         if not article.category:
             reasons.append("최종보고서 상위 카테고리 미확인")
@@ -3236,16 +3327,59 @@ def main() -> int:
         article = record["article"]
         candidate = record["candidate"]
         reasons: list[str] = list(record.get("origin_reasons", []))
+        scoped_order = record.get("after_order") or article.order
+        origin_confirmation = article_scoped_confirmation(
+            run_context.get("article_origin_confirmations", []),
+            article,
+            order=scoped_order,
+        )
+        if origin_confirmation:
+            confirmed_candidate, confirmed_score, confirmation_reasons = confirmed_origin(
+                article,
+                pools,
+                origin_confirmation,
+            )
+            if confirmed_candidate:
+                candidate = confirmed_candidate
+                record["score"] = confirmed_score
+                reasons = (
+                    []
+                    if candidate.extra.get("profile_complete", False)
+                    else ["유입 파일의 작업자·역할 근거 불완전"]
+                )
+            reasons.extend(confirmation_reasons)
+        role_confirmation = article_scoped_confirmation(
+            run_context.get("article_role_confirmations", []),
+            article,
+            order=scoped_order,
+        )
+        role_confirmation_applied = False
+        if role_confirmation:
+            candidate, role_reasons, role_confirmation_applied = apply_confirmed_article_roles(
+                candidate,
+                role_confirmation,
+                valid_schedule_refs,
+                require_schedule,
+            )
+            if role_confirmation_applied:
+                reasons = []
+            reasons.extend(role_reasons)
         if not candidate.extra.get("profile_complete", False):
             reasons.append("유입 파일의 작업자·역할 근거 불완전")
         if not final_profile_complete:
             reasons.append("최종 담당·작업자 근거 불완전")
         if not disposition_complete:
             reasons.append("비대표·미포함 최종 담당 표기 근거 불완전")
+        japan_confirmation = article_scoped_confirmation(
+            run_context.get("article_japan_confirmations", []),
+            article,
+            order=scoped_order,
+        )
         japan_match, japan_score, japan_reasons = japan_membership(
             article,
             japan,
             config["matching"]["review_threshold"],
+            japan_confirmation,
         )
         reasons.extend(japan_reasons)
         japan_value = "O" if japan_match else ""
@@ -3277,8 +3411,11 @@ def main() -> int:
             "automatic_addition": record["kind"] if record.get("automatic") else None,
             "reference_file": record.get("reference_file"),
             "confirmation_evidence": record["evidence"],
-            "role_confirmed_from_reference": False,
+            "context_confirmation": (origin_confirmation or {}).get("evidence", []),
+            "role_confirmation": (role_confirmation or {}).get("evidence", []),
+            "role_confirmed_from_reference": role_confirmation_applied,
             "japan_match_score": round(japan_score, 4),
+            "japan_confirmation": (japan_confirmation or {}).get("evidence", []),
         }
         return row, detail, reasons
 
