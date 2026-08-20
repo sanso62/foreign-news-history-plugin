@@ -1368,6 +1368,37 @@ class PublicPackageSafetyTests(unittest.TestCase):
 
 
 class ArticleScopedContextTests(unittest.TestCase):
+    def test_japan_bundle_profile_does_not_override_article_edit_roles(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            japan_json = Path(temp_dir) / "japan.json"
+            japan_json.write_text(
+                json.dumps({
+                    "values": [
+                        ["제목", "매체명", "날짜"],
+                        ["현재 일본 기사", "현재 일본 매체", "8.12"],
+                    ]
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            candidates, warnings = process_job.japan_candidates(
+                japan_json,
+                {
+                    "workgroup": "일본문화원",
+                    "owner": "오전/총괄",
+                    "worker": "작업자갑",
+                    "evidence": ["일본동향 전체 묶음이 총괄본에 존재"],
+                    "schedule_refs": ["근무!8"],
+                },
+                valid_schedule_refs={"근무!8": "작업자갑"},
+                require_schedule=True,
+            )
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].workgroup, "일본문화원")
+        self.assertEqual((candidates[0].owner, candidates[0].worker), ("", ""))
+        self.assertFalse(candidates[0].extra["profile_complete"])
+        self.assertTrue(any("기사별 재판정" in warning for warning in warnings))
+
     def test_confirmation_distinguishes_duplicate_orders_by_identity(self):
         article = process_job.Article(
             source_file="final.hwpx",

@@ -1515,16 +1515,24 @@ def japan_candidates(
 ) -> tuple[list[Candidate], list[str]]:
     if path is None:
         return [], ["일본동향 선택 입력 미제공: 일일일본동향 열은 공란으로 유지"]
-    workgroup, owner, worker = profile_fields(profile)
+    workgroup, declared_owner, declared_worker = profile_fields(profile)
+    # The Japan source is a bundle, not an edit-stage file.  A role declared on
+    # the bundle cannot prove that every article was first edited by the same
+    # person.  Seed only its special workgroup and let
+    # enrich_special_source_roles() derive owner/worker per article from the
+    # current run's schedule-backed workfiles.
+    owner = ""
+    worker = ""
     candidates: list[Candidate] = []
     warnings: list[str] = []
-    semantic_errors = role_semantic_errors("japan", "", workgroup, owner)
-    profile_complete = profile_is_complete(
-        profile,
-        valid_schedule_refs=valid_schedule_refs,
-        require_schedule=require_schedule,
-    ) and not semantic_errors
+    semantic_errors = role_semantic_errors("japan", "", workgroup, "")
+    profile_complete = False
     warnings.extend(f"일본동향 역할 의미 불일치: {error}" for error in semantic_errors)
+    if declared_owner or declared_worker:
+        warnings.append(
+            "일본동향 묶음의 공통 담당·작업자 선언은 사용하지 않고 "
+            "현재 작업본 비교로 기사별 재판정"
+        )
     if path.suffix.lower() == ".json" and path.is_file():
         try:
             rows = rows_from_json(path)
@@ -1817,13 +1825,15 @@ def enrich_special_source_roles(
     worker_candidates: list[Candidate],
     matching: dict[str, float],
 ) -> list[Candidate]:
-    """Keep a special workgroup while deriving its set-level editor.
+    """Keep a special workgroup while deriving each article's editor.
 
     A Japan report is assigned as one work packet.  Some days its articles are
     carried by an auxiliary file and on other days the aggregate editor imports
-    the complete packet.  Choose the current, schedule-backed file that covers
-    the most supplied Japan articles instead of assigning different editors per
-    article.
+    the complete packet.  Normally the current, schedule-backed file that covers
+    the most supplied Japan articles supplies the role.  When a substantive
+    auxiliary file covers all but one item, preserve that contribution for its
+    covered articles and use the aggregate editor only for uncovered or
+    heading-only items.
     """
     eligible_workers = [
         item for item in worker_candidates if item.extra.get("profile_complete", False)
