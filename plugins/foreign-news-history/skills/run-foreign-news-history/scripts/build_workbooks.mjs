@@ -66,6 +66,19 @@ function addMatrixSheet(workbook, name, matrix, options = {}) {
   return sheet;
 }
 
+function workbookRow(result, row) {
+  const converted = [...row];
+  if (
+    result.workbook?.date_column_mode === "numeric_month_day"
+    && typeof converted[9] === "string"
+    && /^\d{1,2}\.\d{1,2}$/.test(converted[9].trim())
+  ) {
+    const numericDate = Number(converted[9]);
+    if (Number.isFinite(numericDate)) converted[9] = numericDate;
+  }
+  return converted;
+}
+
 async function renderAndInspect(workbook, workbookName, previewDir) {
   const qa = { workbook: workbookName, sheets: [], formulaErrors: [] };
   const overview = await workbook.inspect({
@@ -122,7 +135,7 @@ async function renderAndInspect(workbook, workbookName, previewDir) {
 
 function buildIntermediateWorkbook(result, review, manifest) {
   const workbook = Workbook.create();
-  const historyMatrix = [result.headers, ...result.rows];
+  const historyMatrix = [result.headers, ...result.rows.map((row) => workbookRow(result, row))];
   const historySheet = addMatrixSheet(workbook, "작업이력", historyMatrix, {
     widths: [14, 13, 12, 13, 13, 13, 13, 18, 18, 10, 58, 15, 13, 13, 42],
   });
@@ -137,7 +150,7 @@ function buildIntermediateWorkbook(result, review, manifest) {
     item.origin || "",
     item.score,
     (item.reasons || []).join("; "),
-    ...item.row,
+    ...workbookRow(result, item.row),
   ]);
   addMatrixSheet(workbook, "확인필요", [reviewHeaders, ...reviewRows], {
     widths: [10, 10, 12, 11, 45, 14, 13, 12, 13, 13, 13, 13, 18, 18, 10, 58, 15, 13, 13, 42],
@@ -182,7 +195,7 @@ function buildReviewWorkbook(result, review) {
     item.origin || "",
     item.score,
     (item.reasons || []).join("; "),
-    ...item.row,
+    ...workbookRow(result, item.row),
   ]);
   addMatrixSheet(workbook, "확인필요", [headers, ...rows], {
     widths: [10, 10, 12, 11, 45, 14, 13, 12, 13, 13, 13, 13, 18, 18, 10, 58, 15, 13, 13, 42],

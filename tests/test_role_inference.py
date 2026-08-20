@@ -1023,6 +1023,24 @@ class AggregateRecoveryTests(unittest.TestCase):
         )
         self.assertEqual({}, mappings)
 
+    def test_legacy_source_schema_uses_numeric_workbook_date_cells(self):
+        legacy = process_job.Candidate(
+            "regular", "기사", "매체", "",
+            extra={"source_history_operational_fields": False},
+        )
+        self.assertEqual(
+            "numeric_month_day",
+            process_job.workbook_date_column_mode([legacy]),
+        )
+
+    def test_current_or_empty_source_schema_keeps_text_workbook_date_cells(self):
+        current = process_job.Candidate(
+            "regular", "기사", "매체", "",
+            extra={"source_history_operational_fields": True},
+        )
+        self.assertEqual("text", process_job.workbook_date_column_mode([current]))
+        self.assertEqual("text", process_job.workbook_date_column_mode([]))
+
     def test_one_day_regular_carryover_absent_in_afternoon_uses_morning_editor(self):
         target_date = process_job.dt.date(2026, 8, 12)
         article = process_job.Article(

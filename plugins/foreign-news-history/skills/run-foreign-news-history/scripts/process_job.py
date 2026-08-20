@@ -1298,6 +1298,13 @@ def source_history_has_operational_fields(candidates: list[Candidate]) -> bool:
     )
 
 
+def workbook_date_column_mode(candidates: list[Candidate]) -> str:
+    """Preserve the date-cell convention carried by the source-history schema."""
+    if candidates and not source_history_has_operational_fields(candidates):
+        return "numeric_month_day"
+    return "text"
+
+
 def adjacent_compound_category_labels(
     final_categories: list[str],
     aggregate_front_categories: list[str],
@@ -3998,6 +4005,9 @@ def main() -> int:
     result = {
         "headers": RESULT_HEADERS,
         "rows": rows,
+        "workbook": {
+            "date_column_mode": workbook_date_column_mode(regular),
+        },
         "articles": [asdict(article) for article in final_articles],
         "confirmed_additions": [
             {
