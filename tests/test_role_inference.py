@@ -185,16 +185,15 @@ class OriginOrderTests(unittest.TestCase):
         )
         self.assertEqual({("오전/총괄", "작업자병")}, {(item.owner, item.worker) for item in result})
 
-    def test_nearly_complete_japan_auxiliary_keeps_only_substantive_matches(self):
+    def test_nearly_complete_japan_auxiliary_keeps_only_substantive_worker_matches(self):
         japan = [
             process_job.Candidate(
                 "japan", title, media, "8.12", workgroup="일본문화원",
-                extra={"body_content_count": body_count},
             )
-            for title, media, body_count in (
-                ("첫 기사", "첫 매체", 1),
-                ("둘째 기사", "둘째 매체", 0),
-                ("셋째 기사", "셋째 매체", 1),
+            for title, media in (
+                ("첫 기사", "첫 매체"),
+                ("둘째 기사", "둘째 매체"),
+                ("셋째 기사", "셋째 매체"),
             )
         ]
         auxiliary = [
@@ -203,9 +202,13 @@ class OriginOrderTests(unittest.TestCase):
                 owner="보조", worker="작업자정", extra={
                     "comparison_stage": "morning", "profile_complete": True,
                     "source_kind": "morning_auxiliary", "schedule_refs": ["근무!6"],
+                    "body_content_count": body_count,
                 },
             )
-            for title, media in (("첫 기사", "첫 매체"), ("둘째 기사", "둘째 매체"))
+            for title, media, body_count in (
+                ("첫 기사", "첫 매체", 3),
+                ("둘째 기사", "둘째 매체", 0),
+            )
         ]
         aggregate = [
             process_job.Candidate(
@@ -225,29 +228,51 @@ class OriginOrderTests(unittest.TestCase):
             [(item.owner, item.worker) for item in result],
         )
 
-    def test_current_schema_conflict_qualifies_only_direct_identity(self):
-        article = process_job.Article(
-            "final.hwp", 1, "경제", "Bloomberg", "8.12", "최종 제목", "최종 제목"
+    def test_same_day_japan_auxiliary_keeps_morning_stage(self):
+        japan = [
+            process_job.Candidate(
+                "japan", "당일 기사", "현재 매체", "8.13", workgroup="일본문화원"
+            ),
+            process_job.Candidate(
+                "japan", "전일 기사", "과거 매체", "8.12", workgroup="일본문화원"
+            ),
+        ]
+        auxiliary = [
+            process_job.Candidate(
+                "worker", item.title, item.media, item.date, source_file="auxiliary.hwp",
+                owner="보조", worker="작업자정", extra={
+                    "comparison_stage": "morning",
+                    "profile_complete": True,
+                    "source_kind": "morning_auxiliary",
+                    "schedule_refs": ["근무!6"],
+                    "body_content_count": 3,
+                },
+            )
+            for item in japan
+        ]
+        result = process_job.enrich_special_source_roles(
+            japan,
+            auxiliary,
+            {"review_threshold": 0.9},
+            process_job.dt.date(2026, 8, 13),
         )
-        regular = process_job.Candidate(
-            "regular", article.body_title, "Bloomberg", "8.12",
-            extra={"source_history_operational_fields": True},
+        self.assertEqual(
+            [("오전/보조", "작업자정"), ("보조", "작업자정")],
+            [(item.owner, item.worker) for item in result],
         )
-        exact = process_job.Candidate(
-            "worker", article.body_title, "Bloomberg", "8.12",
-            owner="국내", extra={
-                "source_kind": "domestic_draft", "comparison_stage": "afternoon",
-            },
+
+    def test_current_schema_draft_role_is_not_stage_qualified(self):
+        self.assertEqual(
+            [],
+            process_job.role_semantic_errors(
+                "worker", "domestic_draft", "1조", "국내"
+            ),
         )
-        rewritten = replace(exact, title="초안 단계의 다른 제목")
-        qualified = process_job.qualify_current_schema_draft_conflict(
-            article, exact, [regular], self.MATCHING
+        self.assertTrue(
+            process_job.role_semantic_errors(
+                "worker", "domestic_draft", "1조", "오후/국내"
+            )
         )
-        unchanged = process_job.qualify_current_schema_draft_conflict(
-            article, rewritten, [regular], self.MATCHING
-        )
-        self.assertEqual("오후/국내", qualified.owner)
-        self.assertEqual("국내", unchanged.owner)
 
     def test_slash_group_sets_representative_title(self):
         articles = [
@@ -585,7 +610,7 @@ class OriginOrderTests(unittest.TestCase):
             "worker", article.body_title, "Example News", "4.2",
             workgroup="morning", owner="coordinator", worker="worker",
             extra={
-                "source_kind": "late_morning_aggregate", "comparison_stage": "morning",
+                "source_kind": "morning_aggregate", "comparison_stage": "morning",
                 "profile_complete": True, "priority": 10,
             },
         )
@@ -968,43 +993,27 @@ class AggregateRecoveryTests(unittest.TestCase):
         self.assertEqual(1, len(additions))
         self.assertIs(regular, additions[0]["candidate"])
 
-    def test_latest_target_date_article_uses_late_morning_role(self):
+    def test_latest_target_date_article_keeps_morning_aggregate_role(self):
         article = process_job.Article(
             "final.hwp", 1, "증시", "현재 매체", "8.3", "새 기사", "새 기사"
         )
         origin = process_job.Candidate(
             "worker", "새 기사", "현재 매체", "8.3", source_file="morning 2차.hwp",
             workgroup="2조", owner="오전/총괄", worker="작업자병",
-            extra={"source_kind": "morning_aggregate", "comparison_stage": "morning"},
+            extra={
+                "source_kind": "morning_aggregate",
+                "comparison_stage": "morning",
+                "profile_complete": True,
+            },
         )
-        changed = process_job.late_morning_aggregate_origin(
-            article, origin, {"regular": [], "japan": [], "worker": [origin]},
-            self.MATCHING, process_job.dt.date(2026, 8, 3),
-        )
-        self.assertEqual(("1조", "오후/총괄"), (changed.workgroup, changed.owner))
-        self.assertEqual("late_morning_aggregate", changed.extra["source_kind"])
-
-    def test_current_source_schema_uses_morning_late_aggregate_role(self):
-        article = process_job.Article(
-            "final.hwp", 1, "증시", "현재 매체", "8.3", "새 기사", "새 기사"
-        )
-        origin = process_job.Candidate(
-            "worker", article.body_title, article.media, article.date,
-            source_file="morning 2차.hwp", workgroup="2조", owner="오전/총괄", worker="작업자병",
-            extra={"source_kind": "morning_aggregate", "comparison_stage": "morning"},
-        )
-        current_regular = process_job.Candidate(
-            "regular", "다른 정기 기사", "다른 매체", "8.2",
-            extra={"source_history_operational_fields": True},
-        )
-        changed = process_job.late_morning_aggregate_origin(
+        chosen, _, reasons, _ = process_job.choose_origin(
             article,
-            origin,
-            {"regular": [current_regular], "japan": [], "worker": [origin]},
+            {"regular": [], "japan": [], "worker": [origin]},
             self.MATCHING,
-            process_job.dt.date(2026, 8, 3),
         )
-        self.assertEqual(("1조", "오전/총괄"), (changed.workgroup, changed.owner))
+        self.assertIs(origin, chosen)
+        self.assertEqual(("2조", "오전/총괄"), (chosen.workgroup, chosen.owner))
+        self.assertEqual([], reasons)
 
     def test_adjacent_compound_category_uses_workfile_spelling_without_alias_table(self):
         mappings = process_job.adjacent_compound_category_labels(
@@ -1463,11 +1472,11 @@ class ArticleScopedContextTests(unittest.TestCase):
                 "현재 매체",
                 "8.12",
                 source_file="morning-second-pass.hwpx",
-                workgroup="1조",
-                owner="오후/총괄",
+                workgroup="2조",
+                owner="오전/총괄",
                 worker="현재 작업자",
                 extra={
-                    "source_kind": "late_morning_aggregate",
+                    "source_kind": "morning_aggregate",
                     "comparison_stage": "morning",
                     "profile_complete": True,
                 },
@@ -1475,7 +1484,7 @@ class ArticleScopedContextTests(unittest.TestCase):
             confirmed, reasons, applied = process_job.apply_confirmed_article_roles(
                 automatically_rewritten,
                 {
-                    "workgroup": "1조",
+                    "workgroup": "2조",
                     "owner": "오전/총괄",
                     "worker": "현재 작업자",
                     "evidence": ["같은 작업일 기준표와 현재 원본을 대조함"],
@@ -1491,9 +1500,9 @@ class ArticleScopedContextTests(unittest.TestCase):
         self.assertEqual(reasons, [])
         self.assertEqual(
             (confirmed.workgroup, confirmed.owner, confirmed.worker),
-            ("1조", "오전/총괄", "현재 작업자"),
+            ("2조", "오전/총괄", "현재 작업자"),
         )
-        self.assertEqual(confirmed.extra["source_kind"], "late_morning_aggregate")
+        self.assertEqual(confirmed.extra["source_kind"], "morning_aggregate")
         self.assertTrue(confirmed.extra["role_confirmed_from_reference"])
 
 

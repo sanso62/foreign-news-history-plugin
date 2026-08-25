@@ -68,7 +68,6 @@ COPIED_WORKFILE_SOURCE_KINDS = {
     "afternoon_aggregate",
     "morning_auxiliary",
     "morning_aggregate",
-    "late_morning_aggregate",
 }
 
 # These are workflow-stage labels, not person mappings.  They are intentionally
@@ -80,11 +79,32 @@ WORKFILE_ROLE_LABELS = {
     "afternoon_aggregate_omitted": ("1조", "오후/총괄"),
     "morning_auxiliary": ("2조", "보조"),
     "morning_aggregate": ("2조", "오전/총괄"),
-    "late_morning_aggregate": ("1조", "오후/총괄"),
 }
 REFERENCE_ROLE_LABELS = {
     "regular": ("정기", "오후/총괄"),
 }
+
+
+def special_source_actual_owner(
+    source_kind: str,
+    owner: str,
+    article_date: str = "",
+    job_date: dt.date | None = None,
+) -> str:
+    """Keep the morning stage for same-day Japan items edited by an auxiliary."""
+    owner = clean_text(owner)
+    if not owner or "/" in owner:
+        return owner
+    parsed_article_date = parse_date(article_date)
+    is_job_date = bool(
+        job_date
+        and parsed_article_date
+        and (parsed_article_date.month, parsed_article_date.day)
+        == (job_date.month, job_date.day)
+    )
+    if clean_text(source_kind) == "morning_auxiliary" and is_job_date:
+        return f"오전/{owner}"
+    return owner
 
 ARTICLE_HEADING = re.compile(r"^\s*(?P<star>\*)?\s*<(?P<meta>[^>]+)>\s*(?P<title>.+?)\s*$")
 DATE_IN_META = re.compile(r"(?<!\d)(?P<month>\d{1,2})\.(?P<day>\d{1,2})(?!\d)")
@@ -921,18 +941,8 @@ def role_semantic_errors(
         expected_group, expected_owner = expected
         if workgroup and workgroup not in {expected_group, "순방"}:
             errors.append(f"{source_kind} 작업조는 {expected_group} 또는 근거 있는 순방이어야 함")
-        allowed_owners = {expected_owner}
-        if source_kind in INITIAL_DRAFT_SOURCE_KINDS:
-            # A current-schema draft can retain its base role while recording
-            # which comparison stage resolved a regular-history conflict.
-            allowed_owners.update({f"오전/{expected_owner}", f"오후/{expected_owner}"})
-        elif source_kind == "late_morning_aggregate":
-            # Legacy snapshots treated this as the afternoon total role, while
-            # current snapshots carry the morning-total role explicitly.
-            allowed_owners.update({"오전/총괄", "오후/총괄"})
-        if owner and owner not in allowed_owners:
-            expected_labels = " 또는 ".join(sorted(allowed_owners))
-            errors.append(f"{source_kind} 초벌 담당은 {expected_labels}이어야 함")
+        if owner and owner != expected_owner:
+            errors.append(f"{source_kind} 초벌 담당은 {expected_owner}이어야 함")
         return errors
 
     if source_type == "japan":
@@ -943,8 +953,15 @@ def role_semantic_errors(
                 expected = WORKFILE_ROLE_LABELS.get(actual_edit_source_kind)
                 if expected is None:
                     errors.append(f"일본동향 실제 편집 source_kind 미확인: {actual_edit_source_kind}")
-                elif owner != expected[1]:
-                    errors.append(f"일본동향 초벌 담당은 실제 편집 단계 {expected[1]}이어야 함")
+                else:
+                    allowed_owners = {expected[1]}
+                    if actual_edit_source_kind == "morning_auxiliary":
+                        allowed_owners.add(f"오전/{expected[1]}")
+                    if owner not in allowed_owners:
+                        expected_owner = " 또는 ".join(sorted(allowed_owners))
+                        errors.append(
+                            f"일본동향 초벌 담당은 실제 편집 단계 {expected_owner}이어야 함"
+                        )
             elif owner not in {value[1] for value in WORKFILE_ROLE_LABELS.values()}:
                 errors.append("일본동향 초벌 담당이 허용된 실제 편집 단계 표기가 아님")
         return errors
@@ -1337,7 +1354,7 @@ def apply_aggregate_front_category_labels(
     candidates: list[Candidate],
 ) -> None:
     """Adopt compound category labels explicitly printed by aggregate workfiles."""
-    aggregate_kinds = {"morning_aggregate", "afternoon_aggregate", "late_morning_aggregate"}
+    aggregate_kinds = {"morning_aggregate", "afternoon_aggregate"}
     sources: dict[str, tuple[int, int]] = {}
     for candidate in candidates:
         source_kind = clean_text(candidate.extra.get("source_kind"))
@@ -1688,51 +1705,6 @@ def explicit_similar_cluster_regular(
     return ranked[0]
 
 
-def qualify_current_schema_draft_conflict(
-    article: Article,
-    candidate: Candidate,
-    regular_candidates: list[Candidate],
-    matching: dict[str, float],
-) -> Candidate:
-    """Use a stage-qualified owner only for a resolved current-schema conflict."""
-    if (
-        clean_text(candidate.extra.get("source_kind")) not in INITIAL_DRAFT_SOURCE_KINDS
-        or candidate.extra.get("lineage_inferred_from_aggregate")
-        or not source_history_has_operational_fields(regular_candidates)
-        or not candidate.owner
-        or "/" in candidate.owner
-        or not (
-            candidate_identity_matches(article, candidate)
-            or (
-                article.similar
-                and any(
-                    normalize_key(regular.title)
-                    in {
-                        normalize_key(title)
-                        for title in article.match_titles
-                        if normalize_key(title)
-                    }
-                    for regular in regular_candidates
-                )
-            )
-        )
-        or not any(
-            candidate_score(article, regular) >= matching["auto_threshold"]
-            for regular in regular_candidates
-        )
-    ):
-        return candidate
-    stage = {
-        "afternoon": "오후",
-        "morning": "오전",
-    }.get(clean_text(candidate.extra.get("comparison_stage")), "오후")
-    return replace(
-        candidate,
-        owner=f"{stage}/{candidate.owner}",
-        extra={**candidate.extra, "stage_qualified_reference_conflict": True},
-    )
-
-
 def ranked_matches(article: Article, candidates: list[Candidate]) -> list[tuple[float, Candidate]]:
     return sorted(
         ((candidate_score(article, candidate), candidate) for candidate in candidates),
@@ -1824,6 +1796,7 @@ def enrich_special_source_roles(
     candidates: list[Candidate],
     worker_candidates: list[Candidate],
     matching: dict[str, float],
+    job_date: dt.date | None = None,
 ) -> list[Candidate]:
     """Keep a special workgroup while deriving each article's editor.
 
@@ -1842,6 +1815,7 @@ def enrich_special_source_roles(
     for source_file in dict.fromkeys(item.source_file for item in eligible_workers):
         current = [item for item in eligible_workers if item.source_file == source_file]
         matched_scores: dict[int, float] = {}
+        matched_workers: dict[int, Candidate] = {}
         for candidate in candidates:
             probe = Article(
                 source_file=candidate.source_file,
@@ -1855,6 +1829,7 @@ def enrich_special_source_roles(
             ranked = ranked_matches(probe, current)
             if ranked and ranked[0][0] >= matching["review_threshold"]:
                 matched_scores[id(candidate)] = ranked[0][0]
+                matched_workers[id(candidate)] = ranked[0][1]
         if matched_scores:
             representative = current[0]
             stage = clean_text(representative.extra.get("comparison_stage"))
@@ -1865,6 +1840,7 @@ def enrich_special_source_roles(
                 "source_file": source_file,
                 "representative": representative,
                 "matches": matched_scores,
+                "matched_workers": matched_workers,
                 "source_kind": clean_text(representative.extra.get("source_kind")),
             })
 
@@ -1872,7 +1848,7 @@ def enrich_special_source_roles(
         return record["coverage"], record["average"], record["stage_order"]
 
     selected_record = max(file_scores, key=record_key) if file_scores else None
-    aggregate_kinds = {"afternoon_aggregate", "morning_aggregate", "late_morning_aggregate"}
+    aggregate_kinds = {"afternoon_aggregate", "morning_aggregate"}
     aggregate_records = [record for record in file_scores if record["source_kind"] in aggregate_kinds]
     auxiliary_records = [record for record in file_scores if record["source_kind"] == "morning_auxiliary"]
     best_aggregate = max(aggregate_records, key=record_key) if aggregate_records else None
@@ -1893,9 +1869,10 @@ def enrich_special_source_roles(
         # while the aggregate editor remains responsible for heading-only or
         # uncovered items.
         for candidate in candidates:
+            auxiliary_match = best_auxiliary["matched_workers"].get(id(candidate))
             if (
-                int(candidate.extra.get("body_content_count", 0)) > 0
-                and id(candidate) in best_auxiliary["matches"]
+                auxiliary_match is not None
+                and int(auxiliary_match.extra.get("body_content_count", 0)) > 0
             ):
                 selected_by_candidate[id(candidate)] = best_auxiliary
             else:
@@ -1928,6 +1905,12 @@ def enrich_special_source_roles(
         selected_stage = clean_text(selected.extra.get("comparison_stage"))
         refs = list(selected.extra.get("schedule_refs", []))
         selected_source_kind = clean_text(selected.extra.get("source_kind"))
+        selected_owner = special_source_actual_owner(
+            selected_source_kind,
+            selected.owner,
+            candidate.date,
+            job_date,
+        )
         evidence = list(candidate.extra.get("profile_evidence", []))
         evidence.extend(selected.extra.get("profile_evidence", []))
         evidence.append(
@@ -1946,14 +1929,14 @@ def enrich_special_source_roles(
             "japan",
             "",
             candidate.workgroup,
-            selected.owner,
+            selected_owner,
             selected_source_kind,
         )
         extra["profile_complete"] = bool(
             candidate.workgroup and selected.owner and selected.worker and refs and not semantic_errors
         )
         extra["role_semantic_errors"] = semantic_errors
-        enriched.append(replace(candidate, owner=selected.owner, worker=selected.worker, extra=extra))
+        enriched.append(replace(candidate, owner=selected_owner, worker=selected.worker, extra=extra))
     return enriched
 
 
@@ -2262,12 +2245,7 @@ def choose_origin(
         )
         if draft_preferred:
             chosen_score = initial_score
-            chosen = qualify_current_schema_draft_conflict(
-                article,
-                initial_candidate,
-                pools.get("regular", []),
-                matching,
-            )
+            chosen = initial_candidate
             chosen_ranked = [(chosen_score, chosen), *ranked_initial_drafts[1:]]
             chosen_stage = clean_text(initial_candidate.extra.get("comparison_stage")) or "afternoon"
 
@@ -2286,12 +2264,7 @@ def choose_origin(
         )
     ):
         chosen_score, rewritten_candidate = rewritten_trend
-        chosen = qualify_current_schema_draft_conflict(
-            article,
-            rewritten_candidate,
-            pools.get("regular", []),
-            matching,
-        )
+        chosen = rewritten_candidate
         chosen_ranked = [(chosen_score, chosen)]
         chosen_stage = clean_text(chosen.extra.get("comparison_stage")) or "afternoon"
         rewritten_trend_selected = True
@@ -2968,54 +2941,6 @@ def automatic_similar_additions(
     return additions
 
 
-def late_morning_aggregate_origin(
-    article: Article,
-    origin: Candidate | None,
-    pools: dict[str, list[Candidate]],
-    matching: dict[str, float],
-    target_date: dt.date,
-) -> Candidate | None:
-    """Classify a target-date article first introduced in the latest morning aggregate."""
-    if origin is None or clean_text(origin.extra.get("source_kind")) != "morning_aggregate":
-        return origin
-    article_date = parse_date(article.date)
-    if not article_date or (article_date.month, article_date.day) != (target_date.month, target_date.day):
-        return origin
-    morning_aggregates = [
-        candidate
-        for candidate in pools.get("worker", [])
-        if clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
-    ]
-    if not morning_aggregates:
-        return origin
-    latest_revision = max(workfile_revision_rank(candidate.source_file) for candidate in morning_aggregates)
-    if workfile_revision_rank(origin.source_file) != latest_revision:
-        return origin
-    earlier_sources = [
-        candidate
-        for source_type, candidates in pools.items()
-        for candidate in candidates
-        if not (
-            source_type == "worker"
-            and candidate.source_file == origin.source_file
-            and clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
-        )
-    ]
-    if ranked_origin_matches(article, earlier_sources, matching["review_threshold"]):
-        return origin
-    owner = (
-        "오전/총괄"
-        if source_history_has_operational_fields(pools.get("regular", []))
-        else "오후/총괄"
-    )
-    return replace(
-        origin,
-        workgroup="1조",
-        owner=owner,
-        extra={**origin.extra, "source_kind": "late_morning_aggregate"},
-    )
-
-
 def regular_reintroduced_in_morning_origin(
     article: Article,
     origin: Candidate | None,
@@ -3530,7 +3455,7 @@ def main() -> int:
         require_schedule,
     )
     warnings.extend(japan_warnings)
-    japan = enrich_special_source_roles(japan, workers, config["matching"])
+    japan = enrich_special_source_roles(japan, workers, config["matching"], job_date)
     final_profile = run_context.get("final")
     final_profile_complete = profile_is_complete(
         final_profile,
@@ -3636,13 +3561,6 @@ def main() -> int:
             if not origin.extra.get("profile_complete", False):
                 reasons.append("유입 파일의 작업자·역할 근거 불완전")
         origin = regular_reintroduced_in_morning_origin(
-            article,
-            origin,
-            pools,
-            config["matching"],
-            target_date,
-        )
-        origin = late_morning_aggregate_origin(
             article,
             origin,
             pools,
