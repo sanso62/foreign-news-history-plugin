@@ -261,6 +261,34 @@ class OriginOrderTests(unittest.TestCase):
             [(item.owner, item.worker) for item in result],
         )
 
+    def test_legacy_japan_packet_keeps_unqualified_auxiliary_owner(self):
+        japan = [
+            process_job.Candidate(
+                "japan", "당일 기사", "현재 매체", "8.4", workgroup="일본문화원"
+            )
+        ]
+        auxiliary = [
+            process_job.Candidate(
+                "worker", "당일 기사", "현재 매체", "8.4",
+                source_file="auxiliary.hwp", owner="보조", worker="작업자정",
+                extra={
+                    "comparison_stage": "morning",
+                    "profile_complete": True,
+                    "source_kind": "morning_auxiliary",
+                    "schedule_refs": ["근무!6"],
+                    "body_content_count": 3,
+                },
+            )
+        ]
+        result = process_job.enrich_special_source_roles(
+            japan,
+            auxiliary,
+            {"review_threshold": 0.9},
+            process_job.dt.date(2026, 8, 4),
+            qualify_same_day_auxiliary=False,
+        )
+        self.assertEqual([("보조", "작업자정")], [(item.owner, item.worker) for item in result])
+
     def test_current_schema_draft_role_is_not_stage_qualified(self):
         self.assertEqual(
             [],
@@ -1014,6 +1042,49 @@ class AggregateRecoveryTests(unittest.TestCase):
         self.assertIs(origin, chosen)
         self.assertEqual(("2조", "오전/총괄"), (chosen.workgroup, chosen.owner))
         self.assertEqual([], reasons)
+
+    def test_legacy_source_schema_uses_late_role_for_latest_aggregate_only_item(self):
+        article = process_job.Article(
+            "final.hwp", 1, "증시", "현재 매체", "8.3", "새 기사", "새 기사"
+        )
+        origin = process_job.Candidate(
+            "worker", "새 기사", "현재 매체", "8.3", source_file="morning 2차.hwp",
+            workgroup="2조", owner="오전/총괄", worker="작업자병",
+            extra={
+                "source_kind": "morning_aggregate",
+                "comparison_stage": "morning",
+                "profile_complete": True,
+            },
+        )
+        changed = process_job.legacy_late_morning_aggregate_origin(
+            article,
+            origin,
+            {"regular": [], "japan": [], "worker": [origin]},
+            self.MATCHING,
+            process_job.dt.date(2026, 8, 3),
+            enabled=True,
+        )
+        self.assertEqual(("1조", "오후/총괄"), (changed.workgroup, changed.owner))
+        self.assertEqual("late_morning_aggregate", changed.extra["source_kind"])
+
+    def test_current_source_schema_does_not_use_legacy_late_role(self):
+        article = process_job.Article(
+            "final.hwp", 1, "증시", "현재 매체", "8.3", "새 기사", "새 기사"
+        )
+        origin = process_job.Candidate(
+            "worker", "새 기사", "현재 매체", "8.3", source_file="morning 2차.hwp",
+            workgroup="2조", owner="오전/총괄", worker="작업자병",
+            extra={"source_kind": "morning_aggregate", "comparison_stage": "morning"},
+        )
+        unchanged = process_job.legacy_late_morning_aggregate_origin(
+            article,
+            origin,
+            {"regular": [], "japan": [], "worker": [origin]},
+            self.MATCHING,
+            process_job.dt.date(2026, 8, 3),
+            enabled=False,
+        )
+        self.assertIs(origin, unchanged)
 
     def test_adjacent_compound_category_uses_workfile_spelling_without_alias_table(self):
         mappings = process_job.adjacent_compound_category_labels(

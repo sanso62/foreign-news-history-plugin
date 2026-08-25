@@ -68,6 +68,7 @@ COPIED_WORKFILE_SOURCE_KINDS = {
     "afternoon_aggregate",
     "morning_auxiliary",
     "morning_aggregate",
+    "late_morning_aggregate",
 }
 
 # These are workflow-stage labels, not person mappings.  They are intentionally
@@ -79,6 +80,7 @@ WORKFILE_ROLE_LABELS = {
     "afternoon_aggregate_omitted": ("1조", "오후/총괄"),
     "morning_auxiliary": ("2조", "보조"),
     "morning_aggregate": ("2조", "오전/총괄"),
+    "late_morning_aggregate": ("1조", "오후/총괄"),
 }
 REFERENCE_ROLE_LABELS = {
     "regular": ("정기", "오후/총괄"),
@@ -90,6 +92,7 @@ def special_source_actual_owner(
     owner: str,
     article_date: str = "",
     job_date: dt.date | None = None,
+    qualify_same_day_auxiliary: bool = True,
 ) -> str:
     """Keep the morning stage for same-day Japan items edited by an auxiliary."""
     owner = clean_text(owner)
@@ -102,7 +105,11 @@ def special_source_actual_owner(
         and (parsed_article_date.month, parsed_article_date.day)
         == (job_date.month, job_date.day)
     )
-    if clean_text(source_kind) == "morning_auxiliary" and is_job_date:
+    if (
+        qualify_same_day_auxiliary
+        and clean_text(source_kind) == "morning_auxiliary"
+        and is_job_date
+    ):
         return f"오전/{owner}"
     return owner
 
@@ -1797,6 +1804,7 @@ def enrich_special_source_roles(
     worker_candidates: list[Candidate],
     matching: dict[str, float],
     job_date: dt.date | None = None,
+    qualify_same_day_auxiliary: bool = True,
 ) -> list[Candidate]:
     """Keep a special workgroup while deriving each article's editor.
 
@@ -1910,6 +1918,7 @@ def enrich_special_source_roles(
             selected.owner,
             candidate.date,
             job_date,
+            qualify_same_day_auxiliary,
         )
         evidence = list(candidate.extra.get("profile_evidence", []))
         evidence.extend(selected.extra.get("profile_evidence", []))
@@ -2941,6 +2950,70 @@ def automatic_similar_additions(
     return additions
 
 
+def legacy_late_morning_aggregate_origin(
+    article: Article,
+    origin: Candidate | None,
+    pools: dict[str, list[Candidate]],
+    matching: dict[str, float],
+    target_date: dt.date,
+    enabled: bool,
+) -> Candidate | None:
+    """Preserve the legacy late-shift label for a narrow aggregate-only item.
+
+    Older source-history snapshots do not carry the current ``작업날짜`` and
+    ``작업 조`` fields.  In that schema, a target-date article that appears for
+    the first time only in the latest morning aggregate used the established
+    ``1조/오후/총괄`` label.  Current operational snapshots keep the actual
+    morning aggregate role instead.  The schema is current-run evidence, so
+    this compatibility path does not depend on a date, person, or outlet.
+    """
+    if not enabled:
+        return origin
+    if origin is None or clean_text(origin.extra.get("source_kind")) != "morning_aggregate":
+        return origin
+    article_date = parse_date(article.date)
+    if not article_date or (
+        article_date.month,
+        article_date.day,
+    ) != (target_date.month, target_date.day):
+        return origin
+    morning_aggregates = [
+        candidate
+        for candidate in pools.get("worker", [])
+        if clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+    ]
+    if not morning_aggregates:
+        return origin
+    latest_revision = max(
+        workfile_revision_rank(candidate.source_file)
+        for candidate in morning_aggregates
+    )
+    if workfile_revision_rank(origin.source_file) != latest_revision:
+        return origin
+    earlier_sources = [
+        candidate
+        for source_type, candidates in pools.items()
+        for candidate in candidates
+        if not (
+            source_type == "worker"
+            and candidate.source_file == origin.source_file
+            and clean_text(candidate.extra.get("source_kind")) == "morning_aggregate"
+        )
+    ]
+    if ranked_origin_matches(
+        article,
+        earlier_sources,
+        matching["review_threshold"],
+    ):
+        return origin
+    return replace(
+        origin,
+        workgroup="1조",
+        owner="오후/총괄",
+        extra={**origin.extra, "source_kind": "late_morning_aggregate"},
+    )
+
+
 def regular_reintroduced_in_morning_origin(
     article: Article,
     origin: Candidate | None,
@@ -3426,6 +3499,7 @@ def main() -> int:
         clean_text(source_sheet_config.get("source_sheet")),
     )
     warnings.extend(regular_warnings)
+    current_source_history = source_history_has_operational_fields(regular)
     workers, worker_files, worker_warnings = worker_candidates(
         work_paths,
         final_hash,
@@ -3455,7 +3529,13 @@ def main() -> int:
         require_schedule,
     )
     warnings.extend(japan_warnings)
-    japan = enrich_special_source_roles(japan, workers, config["matching"], job_date)
+    japan = enrich_special_source_roles(
+        japan,
+        workers,
+        config["matching"],
+        job_date,
+        qualify_same_day_auxiliary=current_source_history,
+    )
     final_profile = run_context.get("final")
     final_profile_complete = profile_is_complete(
         final_profile,
@@ -3566,6 +3646,14 @@ def main() -> int:
             pools,
             config["matching"],
             target_date,
+        )
+        origin = legacy_late_morning_aggregate_origin(
+            article,
+            origin,
+            pools,
+            config["matching"],
+            target_date,
+            enabled=bool(regular) and not current_source_history,
         )
         if role_confirmation:
             origin, role_confirmation_reasons, role_confirmation_applied = (
