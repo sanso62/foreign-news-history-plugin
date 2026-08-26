@@ -992,7 +992,7 @@ class AggregateRecoveryTests(unittest.TestCase):
     def test_latest_explicit_similar_row_is_recovered(self):
         final = process_job.Article(
             "final.hwp", 1, "경제·기업", "Bloomberg", "8.3", "대표 기사", "대표 기사",
-            body_present=True,
+            body_present=True, normalized_url="https://example.test/shared",
         )
         representative = process_job.Candidate(
             "worker", "대표 기사", "Bloomberg", "8.3", source_file="morning 2차.hwp",
@@ -1003,6 +1003,7 @@ class AggregateRecoveryTests(unittest.TestCase):
         )
         similar = process_job.Candidate(
             "worker", "명시된 유사 기사", "Reuters", "8.3", source_file="morning 2차.hwp",
+            normalized_url="https://example.test/shared",
             extra={
                 "source_kind": "morning_aggregate", "comparison_stage": "morning",
                 "article_order": 2, "similar": True, "starred": True, "category": "경제·기업",
@@ -1011,6 +1012,7 @@ class AggregateRecoveryTests(unittest.TestCase):
         regular = process_job.Candidate(
             "regular", similar.title, similar.media, similar.date,
             workgroup="정기", owner="오후/총괄", worker="작업자병",
+            normalized_url="https://example.test/shared",
             extra={"profile_complete": True},
         )
         additions = process_job.automatic_similar_additions(

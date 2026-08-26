@@ -183,7 +183,8 @@ class SafetyGuardTests(unittest.TestCase):
             "둘째 분류",
             "<둘째 매체 8.10> 둘째 기사",
         ]
-        with mock.patch.object(process_job, "extract_paragraphs", return_value=paragraphs):
+        records = [process_job.ParagraphRecord(text=value) for value in paragraphs]
+        with mock.patch.object(process_job, "extract_paragraph_records", return_value=records):
             with self.assertRaisesRegex(ValueError, "카테고리 구조 불일치"):
                 process_job.parse_document(
                     Path("final.hwpx"),

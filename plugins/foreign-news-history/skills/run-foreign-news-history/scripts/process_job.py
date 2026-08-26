@@ -9,14 +9,19 @@ can inspect before any external write.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import re
+import subprocess
 import sys
 import unicodedata
+import urllib.parse
+import urllib.request
 import zipfile
 import zlib
 from dataclasses import asdict, dataclass, field, replace
@@ -121,6 +126,12 @@ FRONT_CATEGORY = re.compile(r"^[□■▣]\s*(.+)$")
 
 
 @dataclass
+class ParagraphRecord:
+    text: str
+    url: str = ""
+
+
+@dataclass
 class Article:
     source_file: str
     order: int
@@ -136,6 +147,8 @@ class Article:
     raw_heading: str = ""
     front_title_applied: bool = False
     group_representative: bool = False
+    url: str = ""
+    normalized_url: str = ""
 
     @property
     def match_titles(self) -> list[str]:
@@ -155,6 +168,7 @@ class Candidate:
     worker: str = ""
     url: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    normalized_url: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,6 +186,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir")
     parser.add_argument("--config")
+    parser.add_argument(
+        "--node-executable",
+        help="load_workspace_dependencies가 반환한 Node.js 실행 파일",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +227,154 @@ def clean_text(value: Any) -> str:
     text = text.replace("汫╨", " ").replace("汫h", " ")
     text = "".join(ch if ch >= " " or ch in "\n\t" else " " for ch in text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def private_env_values(path: Path | None = None) -> dict[str, str]:
+    env_path = path or (
+        Path(os.environ.get("USERPROFILE") or Path.home())
+        / ".foreign-news-history"
+        / "private.env"
+    )
+    if not env_path.is_file():
+        raise RuntimeError("비공개 URL 정규화 설정 파일을 찾지 못했습니다.")
+    values: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def fetch_private_url_normalizer_source(
+    private_env_path: Path | None = None,
+    timeout_seconds: int = 30,
+) -> str:
+    values = private_env_values(private_env_path)
+    token = clean_text(values.get("FOREIGN_NEWS_RULES_TOKEN"))
+    api_url = clean_text(values.get("FOREIGN_NEWS_URL_NORMALIZER_API_URL"))
+    parsed = urllib.parse.urlparse(api_url)
+    if not token or parsed.scheme != "https" or parsed.netloc.casefold() != "api.github.com":
+        raise RuntimeError("비공개 URL 정규화 설정이 올바르지 않습니다.")
+    request = urllib.request.Request(
+        api_url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "foreign-news-history-url-normalizer",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        encoded = clean_text(payload.get("content"))
+        if clean_text(payload.get("encoding")).casefold() != "base64" or not encoded:
+            raise ValueError("invalid response")
+        source = base64.b64decode(encoded, validate=False).decode("utf-8")
+    except Exception:
+        raise RuntimeError("비공개 URL 정규화 모듈을 최신 상태로 가져오지 못했습니다.") from None
+    if not re.search(r"\bnormalizeArticleUrl\b", source):
+        raise RuntimeError("비공개 URL 정규화 모듈의 함수 계약을 확인하지 못했습니다.")
+    return source
+
+
+def normalize_article_urls_for_run(
+    urls: Iterable[str],
+    node_executable: str,
+    private_env_path: Path | None = None,
+) -> dict[str, str]:
+    node_path = Path(clean_text(node_executable)).resolve()
+    helper_path = Path(__file__).resolve().with_name("normalize_article_urls.mjs")
+    if not node_path.is_file() or not helper_path.is_file():
+        raise RuntimeError("URL 정규화 실행 환경을 찾지 못했습니다.")
+    unique_urls = list(
+        dict.fromkeys(
+            url
+            for value in urls
+            if (url := clean_hyperlink_url(value))
+        )
+    )
+    source = fetch_private_url_normalizer_source(private_env_path)
+    request_payload = json.dumps(
+        {"module_source": source, "urls": unique_urls},
+        ensure_ascii=False,
+    )
+    try:
+        completed = subprocess.run(
+            [str(node_path), str(helper_path)],
+            input=request_payload,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+        response = json.loads(completed.stdout)
+    except Exception:
+        raise RuntimeError("비공개 URL 정규화 모듈 실행에 실패했습니다.") from None
+    normalized = response.get("normalized") if isinstance(response, dict) else None
+    if (
+        completed.returncode != 0
+        or not isinstance(response, dict)
+        or response.get("ok") is not True
+        or not isinstance(normalized, list)
+    ):
+        raise RuntimeError("비공개 URL 정규화 모듈 실행에 실패했습니다.")
+    if len(normalized) != len(unique_urls):
+        raise RuntimeError("비공개 URL 정규화 결과 수가 입력과 다릅니다.")
+    return {
+        raw: clean_text(value)
+        for raw, value in zip(unique_urls, normalized)
+        if clean_text(value)
+    }
+
+
+def apply_normalized_article_urls(
+    articles: Iterable[Article],
+    candidates: Iterable[Candidate],
+    node_executable: str,
+) -> dict[str, int | bool]:
+    article_list = list(articles)
+    candidate_list = list(candidates)
+    items = [*article_list, *candidate_list]
+    raw_urls = [
+        url
+        for item in items
+        if (url := clean_hyperlink_url(item.url))
+    ]
+    normalized = normalize_article_urls_for_run(raw_urls, node_executable)
+
+    def comparison_value(value: str) -> str:
+        normalized_value = clean_text(value)
+        return (
+            normalized_value[:-1]
+            if normalized_value.endswith("/")
+            else normalized_value
+        )
+
+    for item in items:
+        item.normalized_url = comparison_value(
+            normalized.get(clean_hyperlink_url(item.url), "")
+        )
+    return {
+        "normalizer_refreshed": True,
+        "raw_url_count": len(list(dict.fromkeys(clean_hyperlink_url(value) for value in raw_urls))),
+        "normalized_url_count": len(normalized),
+    }
+
+
+def normalized_url_values(item: Article | Candidate) -> set[str]:
+    return {
+        clean_text(value)
+        for value in [item.normalized_url]
+        if clean_text(value)
+    }
 
 
 def normalize_key(value: Any) -> str:
@@ -250,8 +416,29 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def extract_hwpx(path: Path) -> list[str]:
-    paragraphs: list[str] = []
+HTTP_URL = re.compile(r"https?://[^\s;\x00]+", re.IGNORECASE)
+
+
+def clean_hyperlink_url(value: Any) -> str:
+    text = clean_text(value).replace("\\://", "://")
+    match = HTTP_URL.search(text)
+    if not match:
+        return ""
+    url = match.group(0).rstrip(".,)>]}")
+    return url[:-1] if url.endswith("/") else url
+
+
+def one_hyperlink_url(values: Iterable[Any]) -> str:
+    urls: list[str] = []
+    for value in values:
+        url = clean_hyperlink_url(value)
+        if url and url not in urls:
+            urls.append(url)
+    return urls[0] if len(urls) == 1 else ""
+
+
+def extract_hwpx_records(path: Path) -> list[ParagraphRecord]:
+    paragraphs: list[ParagraphRecord] = []
     with zipfile.ZipFile(path) as archive:
         names = sorted(
             name
@@ -277,8 +464,27 @@ def extract_hwpx(path: Path) -> list[str]:
                 )
                 text = clean_text(text)
                 if text:
-                    paragraphs.append(text)
+                    hyperlink_values: list[str] = []
+                    for field in element.iter():
+                        if (
+                            local_name(field.tag) != "fieldBegin"
+                            or clean_text(field.attrib.get("type")).upper() != "HYPERLINK"
+                        ):
+                            continue
+                        for parameter in field.iter():
+                            if (
+                                local_name(parameter.tag) == "stringParam"
+                                and clean_text(parameter.attrib.get("name")) == "Path"
+                            ):
+                                hyperlink_values.append("".join(parameter.itertext()))
+                    paragraphs.append(
+                        ParagraphRecord(text=text, url=one_hyperlink_url(hyperlink_values))
+                    )
     return paragraphs
+
+
+def extract_hwpx(path: Path) -> list[str]:
+    return [record.text for record in extract_hwpx_records(path)]
 
 
 def load_olefile_module() -> Any:
@@ -300,13 +506,75 @@ def load_olefile_module() -> Any:
         return module
 
 
-def extract_hwp(path: Path) -> list[str]:
+def hwp_records(data: bytes) -> Iterable[tuple[int, int, bytes]]:
+    offset = 0
+    while offset + 4 <= len(data):
+        record_header = int.from_bytes(data[offset : offset + 4], "little")
+        offset += 4
+        tag_id = record_header & 0x3FF
+        level = (record_header >> 10) & 0x3FF
+        size = (record_header >> 20) & 0xFFF
+        if size == 0xFFF:
+            if offset + 4 > len(data):
+                break
+            size = int.from_bytes(data[offset : offset + 4], "little")
+            offset += 4
+        payload = data[offset : offset + size]
+        offset += size
+        yield tag_id, level, payload
+
+
+def hwp_control_hyperlink(payload: bytes) -> str:
+    lower = payload.lower()
+    start = lower.find(b"h\x00t\x00t\x00p\x00")
+    if start < 0:
+        return ""
+    return clean_hyperlink_url(payload[start:].decode("utf-16le", errors="ignore"))
+
+
+def extract_hwp_records_from_stream(data: bytes) -> list[ParagraphRecord]:
+    records: list[ParagraphRecord] = []
+    text_parts: list[str] = []
+    urls: list[str] = []
+    paragraph_started = False
+
+    def flush() -> None:
+        nonlocal text_parts, urls, paragraph_started
+        text = clean_text(" ".join(text_parts))
+        if text:
+            records.append(ParagraphRecord(text=text, url=one_hyperlink_url(urls)))
+        text_parts = []
+        urls = []
+        paragraph_started = False
+
+    for tag_id, _level, payload in hwp_records(data):
+        if tag_id == 66:  # HWPTAG_PARA_HEADER
+            if paragraph_started:
+                flush()
+            paragraph_started = True
+            continue
+        if not paragraph_started:
+            paragraph_started = True
+        if tag_id == 67:  # HWPTAG_PARA_TEXT
+            text = clean_text(payload.decode("utf-16le", errors="ignore"))
+            if text:
+                text_parts.append(text)
+        elif tag_id == 71:  # HWPTAG_CTRL_HEADER, including hyperlink fields
+            url = hwp_control_hyperlink(payload)
+            if url:
+                urls.append(url)
+    if paragraph_started:
+        flush()
+    return records
+
+
+def extract_hwp_records(path: Path) -> list[ParagraphRecord]:
     try:
         olefile = load_olefile_module()
     except Exception as exc:  # pragma: no cover - packaging error
         raise RuntimeError(f"HWP 읽기 모듈 초기화 실패: {exc}") from exc
 
-    paragraphs: list[str] = []
+    paragraphs: list[ParagraphRecord] = []
     with olefile.OleFileIO(str(path)) as ole:
         header = ole.openstream("FileHeader").read()
         compressed = bool(header[36] & 1)
@@ -320,34 +588,25 @@ def extract_hwp(path: Path) -> list[str]:
             data = ole.openstream(section_name).read()
             if compressed:
                 data = zlib.decompress(data, -15)
-            offset = 0
-            while offset + 4 <= len(data):
-                record_header = int.from_bytes(data[offset : offset + 4], "little")
-                offset += 4
-                tag_id = record_header & 0x3FF
-                size = (record_header >> 20) & 0xFFF
-                if size == 0xFFF:
-                    if offset + 4 > len(data):
-                        break
-                    size = int.from_bytes(data[offset : offset + 4], "little")
-                    offset += 4
-                payload = data[offset : offset + size]
-                offset += size
-                if tag_id != 67:
-                    continue
-                text = clean_text(payload.decode("utf-16le", errors="ignore"))
-                if text:
-                    paragraphs.append(text)
+            paragraphs.extend(extract_hwp_records_from_stream(data))
     return paragraphs
 
 
-def extract_paragraphs(path: Path) -> list[str]:
+def extract_hwp(path: Path) -> list[str]:
+    return [record.text for record in extract_hwp_records(path)]
+
+
+def extract_paragraph_records(path: Path) -> list[ParagraphRecord]:
     suffix = path.suffix.lower()
     if suffix == ".hwpx":
-        return extract_hwpx(path)
+        return extract_hwpx_records(path)
     if suffix == ".hwp":
-        return extract_hwp(path)
+        return extract_hwp_records(path)
     raise ValueError(f"지원하지 않는 문서 형식: {path}")
+
+
+def extract_paragraphs(path: Path) -> list[str]:
+    return [record.text for record in extract_paragraph_records(path)]
 
 
 def parse_meta(meta: str) -> tuple[str, str]:
@@ -593,7 +852,8 @@ def parse_document(
     *,
     require_category_alignment: bool = False,
 ) -> list[Article]:
-    paragraphs = extract_paragraphs(path)
+    paragraph_records = extract_paragraph_records(path)
+    paragraphs = [record.text for record in paragraph_records]
     entries = front_entries(paragraphs)
     if require_category_alignment:
         category_errors = final_category_alignment_errors(paragraphs, entries)
@@ -625,6 +885,7 @@ def parse_document(
             starred=bool(heading.group("star")),
             similar=bool(heading.group("star")) or not bool(date_value),
             raw_heading=paragraph,
+            url=paragraph_records[index].url,
         )
         articles.append(article)
         positions.append(index)
@@ -1101,6 +1362,8 @@ def regular_candidates(
         if not title:
             continue
         media = clean_text(row.get("매체명 (원어)")) or clean_text(row.get("매체명 (한글)"))
+        online_url = clean_text(row.get("온라인 기사 URL"))
+        short_url = clean_text(row.get("URL (단축)"))
         candidates.append(
             Candidate(
                 source_type="regular",
@@ -1111,7 +1374,7 @@ def regular_candidates(
                 workgroup=workgroup,
                 owner=owner,
                 worker=worker,
-                url=clean_text(row.get("온라인 기사 URL")) or clean_text(row.get("URL (단축)")),
+                url=online_url or short_url,
                 extra={
                     **row,
                     "comparison_stage": "reference",
@@ -1205,6 +1468,7 @@ def worker_candidates(
                     workgroup=workgroup,
                     owner=owner,
                     worker=worker,
+                    url=article.url,
                     extra={
                         "comparison_stage": comparison_stage,
                         "priority": int((profile or {}).get("priority", 0)),
@@ -1427,6 +1691,8 @@ def candidate_as_article(candidate: Candidate) -> Article:
         date=candidate.date,
         body_title=clean_text(candidate.extra.get("body_title")) or candidate.title,
         canonical_title=candidate.title,
+        url=candidate.url,
+        normalized_url=candidate.normalized_url,
     )
 
 
@@ -1573,6 +1839,7 @@ def japan_candidates(
                             workgroup=workgroup,
                             owner=owner,
                             worker=worker,
+                            url=clean_text(row.get("URL") or row.get("온라인 기사 URL")),
                             extra={
                                 "comparison_stage": "reference",
                                 "priority": int((profile or {}).get("priority", 0)),
@@ -1602,6 +1869,7 @@ def japan_candidates(
                         workgroup=workgroup,
                         owner=owner,
                         worker=worker,
+                        url=article.url,
                         extra={
                             "comparison_stage": "reference",
                             "priority": int((profile or {}).get("priority", 0)),
@@ -1620,6 +1888,10 @@ def japan_candidates(
 
 
 def candidate_score(article: Article, candidate: Candidate) -> float:
+    article_urls = normalized_url_values(article)
+    candidate_urls = normalized_url_values(candidate)
+    if article_urls and candidate_urls and article_urls & candidate_urls:
+        return 1.0
     title_score = max(text_similarity(title, candidate.title) for title in article.match_titles)
     media_score = media_similarity(article.media, candidate.media)
     date_score = 1.0 if article.date and candidate.date and normalize_key(article.date) == normalize_key(candidate.date) else 0.0
@@ -1627,7 +1899,11 @@ def candidate_score(article: Article, candidate: Candidate) -> float:
 
 
 def candidate_identity_matches(article: Article, candidate: Candidate) -> bool:
-    """Require exact title identity plus compatible outlet and non-conflicting date."""
+    """Prefer normalized URL identity, otherwise use the legacy document evidence."""
+    article_urls = normalized_url_values(article)
+    candidate_urls = normalized_url_values(candidate)
+    if article_urls and candidate_urls and article_urls & candidate_urls:
+        return True
     exact_title = normalize_key(candidate.title) in {
         normalize_key(title) for title in article.match_titles
     }
@@ -1651,7 +1927,12 @@ def reference_candidates_for_article(
         candidate
         for candidate in candidates
         if (
-            media_similarity(article.media, candidate.media) >= 0.85
+            (
+                normalized_url_values(article)
+                and normalized_url_values(candidate)
+                and normalized_url_values(article) & normalized_url_values(candidate)
+            )
+            or media_similarity(article.media, candidate.media) >= 0.85
             or (
                 article_date is not None
                 and parse_date(candidate.date) == article_date
@@ -1673,7 +1954,14 @@ def regular_reference_covers_explicit_similar_variant(
         and clean_text(candidate.extra.get("source_kind")) in {
             "afternoon_aggregate", "morning_aggregate"
         }
-        and media_similarity(regular.media, candidate.media) >= 0.85
+        and (
+            (
+                normalized_url_values(regular)
+                and normalized_url_values(candidate)
+                and normalized_url_values(regular) & normalized_url_values(candidate)
+            )
+            or media_similarity(regular.media, candidate.media) >= 0.85
+        )
         and candidate_score(probe, candidate) >= matching["auto_threshold"]
         for candidate in worker_candidates
     )
@@ -1735,6 +2023,71 @@ def ranked_origin_matches(
         key=lambda pair: (int(pair[1].extra.get("priority", 0)), pair[0]),
         reverse=True,
     )
+
+
+def url_linked_initial_draft_origin(
+    article: Article,
+    regular_candidates: list[Candidate],
+    worker_candidates: list[Candidate],
+    matching: dict[str, float],
+) -> tuple[float, Candidate] | None:
+    """Select the actual direct draft when its normalized URL equals a regular row.
+
+    A final-report URL can identify the cluster directly.  When the final heading
+    has no usable URL, the existing title/media/date score may associate either
+    member with the final article; URL identity then proves that the regular row
+    and direct draft are the same article and the direct draft owns provenance.
+    """
+    article_urls = normalized_url_values(article)
+    regular_by_url: dict[str, list[Candidate]] = {}
+    for candidate in regular_candidates:
+        for normalized_url in normalized_url_values(candidate):
+            regular_by_url.setdefault(normalized_url, []).append(candidate)
+    ranked: list[tuple[float, Candidate]] = []
+    for draft in worker_candidates:
+        draft_urls = normalized_url_values(draft)
+        if (
+            clean_text(draft.extra.get("source_kind")) not in INITIAL_DRAFT_SOURCE_KINDS
+            or not draft_urls
+            or bool(draft.extra.get("similar", False))
+            or int(draft.extra.get("body_content_count", 0) or 0) <= 0
+        ):
+            continue
+        # A title-only similar line is not an actual individual draft.  Likewise,
+        # when the final report itself carries a usable URL, a different URL pair
+        # from a nearby regular/draft story cannot take ownership through title
+        # similarity alone.  If the final URL is absent, the legacy association
+        # score remains the only available bridge to the proven regular/draft pair.
+        if article_urls and article_urls.isdisjoint(draft_urls):
+            continue
+        linked_regular: list[Candidate] = []
+        for normalized_url in draft_urls:
+            for candidate in regular_by_url.get(normalized_url, []):
+                if candidate not in linked_regular:
+                    linked_regular.append(candidate)
+        if not linked_regular:
+            continue
+        association_score = max(
+            [candidate_score(article, draft)]
+            + [candidate_score(article, candidate) for candidate in linked_regular]
+        )
+        if association_score >= matching["review_threshold"]:
+            ranked.append((association_score, draft))
+    ranked.sort(
+        key=lambda pair: (pair[0], int(pair[1].extra.get("priority", 0))),
+        reverse=True,
+    )
+    if not ranked:
+        return None
+    if (
+        len(ranked) > 1
+        and normalized_url_values(ranked[0][1]).isdisjoint(
+            normalized_url_values(ranked[1][1])
+        )
+        and ranked[0][0] - ranked[1][0] < matching["ambiguity_margin"]
+    ):
+        return None
+    return ranked[0]
 
 
 def unique_rewritten_trend_duplicate(
@@ -2173,6 +2526,12 @@ def choose_origin(
         initial_drafts,
         matching["review_threshold"],
     )
+    url_linked_draft = url_linked_initial_draft_origin(
+        article,
+        pools.get("regular", []),
+        initial_drafts,
+        matching,
+    )
     rewritten_regular = unique_rewritten_regular_before_copied_workfile(
         article,
         pools.get("regular", []),
@@ -2198,6 +2557,7 @@ def choose_origin(
     )
     rewritten_reference_selected = False
     rewritten_trend_selected = False
+    url_linked_draft_selected = False
 
     # Reference history is first in the workflow, but an exact current draft can
     # still establish provenance when the reference title is only a different
@@ -2217,7 +2577,13 @@ def choose_origin(
             or reference_choice[1] is clustered_regular[1]
         )
     )
-    if ranked_initial_drafts:
+    if url_linked_draft is not None:
+        chosen_score, chosen = url_linked_draft
+        chosen_ranked = [url_linked_draft]
+        chosen_stage = clean_text(chosen.extra.get("comparison_stage")) or "afternoon"
+        url_linked_draft_selected = True
+
+    if chosen is None and ranked_initial_drafts:
         initial_score, initial_candidate = ranked_initial_drafts[0]
         reference_score = (
             reference_choice[0]
@@ -2330,6 +2696,7 @@ def choose_origin(
         and not clear_initial_draft
         and not rewritten_reference_selected
         and not rewritten_trend_selected
+        and not url_linked_draft_selected
     ):
         reasons.append(f"낮은 매칭 점수 {chosen_score:.3f}")
     if not chosen.extra.get("profile_complete", False):
@@ -2899,7 +3266,15 @@ def automatic_similar_additions(
         if key in seen:
             continue
         seen.add(key)
-        if any(candidate_score(article, candidate) >= 0.9 for article in final_articles):
+        # The latest aggregate explicitly marks this as a separate similar row.
+        # Preserve that row unless the final already contains the same displayed
+        # title; URL identity controls its origin but does not erase the row.
+        if any(
+            normalize_key(candidate.title) in {
+                normalize_key(title) for title in article.match_titles
+            }
+            for article in final_articles
+        ):
             continue
         sequence = by_file[candidate.source_file]
         position = sequence.index(candidate)
@@ -3509,6 +3884,25 @@ def main() -> int:
         require_schedule,
     )
     warnings.extend(worker_warnings)
+    japan, japan_warnings = japan_candidates(
+        japan_path,
+        source_profiles.get("japan"),
+        valid_schedule_refs,
+        require_schedule,
+    )
+    warnings.extend(japan_warnings)
+    node_executable = clean_text(
+        args.node_executable or os.environ.get("FOREIGN_NEWS_NODE_EXECUTABLE")
+    )
+    url_audit = apply_normalized_article_urls(
+        final_articles,
+        [*regular, *workers, *japan],
+        node_executable,
+    )
+    warnings.append(
+        "URL 정규화 모듈 최신본 적용: "
+        f"원본 {url_audit['raw_url_count']}건, 판정 {url_audit['normalized_url_count']}건"
+    )
     apply_latest_group_titles(
         final_articles,
         workers,
@@ -3522,13 +3916,6 @@ def main() -> int:
         config["matching"]["auto_threshold"],
     )
     apply_aggregate_front_category_labels(final_articles, workers)
-    japan, japan_warnings = japan_candidates(
-        japan_path,
-        source_profiles.get("japan"),
-        valid_schedule_refs,
-        require_schedule,
-    )
-    warnings.extend(japan_warnings)
     japan = enrich_special_source_roles(
         japan,
         workers,
@@ -4004,6 +4391,7 @@ def main() -> int:
             "path": str(japan_path) if japan_path else "",
             "candidate_articles": len(japan),
         },
+        "url_matching": url_audit,
         "files": [final_info, source_info, schedule_info, *([japan_info] if japan_info else []), *worker_files],
         "counts": {
             "final_articles": len(final_articles),
