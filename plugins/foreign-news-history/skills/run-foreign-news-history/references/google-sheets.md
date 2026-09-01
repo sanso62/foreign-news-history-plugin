@@ -20,6 +20,43 @@
 
 입력 전체 시트를 무제한으로 가져오지 않는다. 메타데이터의 실제 그리드 행 수와 `A:O` 15열을 기준으로 한 번에 5만 셀 이하인 겹치지 않는 유한 A1 범위를 만든다. 각 범위를 반드시 `FORMATTED_VALUE`로 읽고 원시 응답의 실제 `range`와 `values`를 로컬 JSON에 보존한다. `search_spreadsheet_rows`의 날짜 문자열 검색으로 대상 행을 수집하지 않는다. 표시값이 `2026. 7. 22`인데 `2026-07-22`를 검색하면 날짜 셀은 빠지고 URL에 해당 문자열이 든 일부 행만 남을 수 있기 때문이다.
 
+### 대용량 조회 응답 저장
+
+Windows에서는 조회 결과 전체를 PowerShell 명령 인자나 here-string에 넣으면 명령 길이 제한을 넘을 수 있다. 조회와 저장을 한 번의 `functions.exec` 안에서 끝내 데이터 본문이 모델 출력이나 셸 명령줄을 통과하지 않게 한다. 먼저 작은 로컬 작업 디렉터리만 만든 뒤, 아래 형태로 실제 범위 배열과 출력 경로를 넣는다. 출력 파일은 비어 있는 새 실행 폴더에서 처음 만드는 파일이어야 한다.
+
+```javascript
+function resultOf(call) {
+  if (call?.structuredContent?.result) return call.structuredContent.result;
+  const block = call?.content?.find((item) => item.type === "text");
+  const parsed = JSON.parse(block?.text ?? "{}");
+  return parsed.result ?? parsed;
+}
+
+function addFilePatch(path, value) {
+  const body = JSON.stringify(value, null, 2)
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => `+${line}`)
+    .join("\n");
+  return `*** Begin Patch\n*** Add File: ${path.replace(/\\/g, "/")}\n${body}\n*** End Patch`;
+}
+
+const chunks = [];
+for (const range of ranges) {
+  const call = await tools.mcp__codex_apps__google_drive_get_spreadsheet_range({
+    spreadsheet_id: spreadsheetId,
+    sheet_name: sheetName,
+    range,
+    value_render_option: "FORMATTED_VALUE",
+  });
+  chunks.push(resultOf(call));
+}
+await tools.apply_patch(addFilePatch(outputPath, { chunks }));
+text(JSON.stringify({ saved: outputPath, chunks: chunks.length }));
+```
+
+근무 일정처럼 단일 범위를 저장할 때도 같은 함수를 사용하되 `{ chunks }` 대신 `resultOf(call)` 자체를 저장한다. `text()`나 `notify()`에는 셀 값, 문서 ID, 전체 도구 응답을 넣지 않는다. `apply_patch`가 성공하지 않았으면 같은 조회를 반복하기 전에 대상 파일 존재 여부부터 확인한다.
+
 모든 범위의 헤더와 행을 원본 순서로 합친 뒤 `scripts/prepare_source_history.py`에 작업일 전날 ISO 날짜를 전달한다. 이 스크립트가 표시 날짜를 로컬에서 파싱해 해당 보도일 행을 고르고, 추가로 `작업날짜`가 대상일과 같으면서 `보도일`은 정확히 하루 전인 재반영 후보만 보존한다. `source_audit`에는 `bounded_range_scan`, `FORMATTED_VALUE`, 실제 스캔 범위, 스캔·전체 일치 행 수와 두 선택 규칙별 일치 행 수를 기록한다. 감사정보가 없거나 날짜 검색 결과인 입력은 `process_job.py`가 거부한다.
 
 `0. 근무 일정` 탭은 매 실행 먼저 메타데이터로 실제 탭 이름, `sheetId`, 그리드 행·열 수를 확인한다. 메타데이터가 가리키는 그리드를 `assets/harness.config.json`의 `schedule_scan_max_cells` 이하 청크로 나누어 `동향 스케줄`과 정확히 일치하는 셀을 찾는다. 청크는 서로 겹치지 않게 조회하고 빈 검색어나 전체 그리드 단일 조회를 사용하지 않는다. 제목 셀을 찾으면 그 주변의 작은 범위를 읽어 아래쪽에 `보고서`, `구분`, 최종보고서 작업일의 요일, 최소 5개의 요일 헤더가 함께 있는지 확인한다. 유효한 표가 없거나 둘 이상이면 범위를 추측하지 않고 중단한다.
