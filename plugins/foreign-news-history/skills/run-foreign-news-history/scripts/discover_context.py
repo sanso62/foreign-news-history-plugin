@@ -25,6 +25,7 @@ from process_job import (
     resolve_japan_input,
     run_fingerprint,
     sha256_file,
+    source_scan_audit_errors,
 )
 
 
@@ -192,6 +193,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--afternoon-dir", required=True)
     parser.add_argument("--final-report", required=True)
     parser.add_argument("--source-json", required=True)
+    parser.add_argument("--source-xlsx", help="작업내역: 으로 명시된 원본 XLSX")
     parser.add_argument("--schedule-json", required=True, help="작업일 요일을 선택한 동향 스케줄 근거 JSON")
     parser.add_argument(
         "--japan-input",
@@ -269,6 +271,8 @@ def main() -> int:
     afternoon = Path(args.afternoon_dir).resolve()
     final_report = Path(args.final_report).resolve()
     source_json = Path(args.source_json).resolve()
+    source_xlsx_arg = getattr(args, "source_xlsx", None)
+    source_xlsx = Path(source_xlsx_arg).resolve() if source_xlsx_arg is not None else None
     schedule_json = Path(args.schedule_json).resolve()
     japan = resolve_japan_input(final_report, args.japan_input)
     output = Path(args.output).resolve()
@@ -287,11 +291,25 @@ def main() -> int:
     work_files = list(iter_document_files(morning)) + list(iter_document_files(afternoon))
     japan_files = list(iter_document_files(japan)) if japan else []
     all_inputs = [final_report, source_json, schedule_json, *work_files]
+    if source_xlsx is not None:
+        if not source_xlsx.is_file():
+            raise ValueError("지정한 작업내역 XLSX가 없습니다. Google Sheets로 대체하지 않습니다.")
+        all_inputs.append(source_xlsx)
     all_inputs.extend(japan_files)
     if japan and japan.suffix.lower() == ".json":
         all_inputs.append(japan)
 
     job_date, job_evidence = document_job_date(final_report)
+    source_data = json.loads(source_json.read_text(encoding="utf-8-sig"))
+    source_audit = source_data.get("source_audit", {}) if isinstance(source_data, dict) else {}
+    if source_xlsx is not None or source_audit.get("retrieval_method") == "local_xlsx":
+        if not job_date:
+            raise ValueError("XLSX 작업내역 검증에 필요한 최종보고서 작업일을 확인할 수 없습니다.")
+        errors = source_scan_audit_errors(
+            source_json, job_date - dt.timedelta(days=1), expected_source_xlsx=source_xlsx,
+        )
+        if errors:
+            raise ValueError("; ".join(errors))
     schedule = json.loads(schedule_json.read_text(encoding="utf-8-sig"))
     schedule_job_date = clean_text(schedule.get("job_date"))
     if job_date and schedule_job_date != job_date.isoformat():
@@ -360,6 +378,11 @@ def main() -> int:
     draft = {
         "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         "input_fingerprint": run_fingerprint(all_inputs),
+        "source_history": {
+            "mode": "local_xlsx" if source_xlsx is not None else "google_sheets",
+            "path": str(source_xlsx) if source_xlsx is not None else str(source_json),
+            "sha256": sha256_file(source_xlsx or source_json),
+        },
         "job_date": {
             "value": job_date.isoformat() if job_date else "",
             "confidence": "document-derived" if job_date else "unresolved",

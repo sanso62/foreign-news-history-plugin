@@ -178,6 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--afternoon-dir", required=True)
     parser.add_argument("--final-report", required=True)
     parser.add_argument("--source-json", required=True)
+    parser.add_argument("--source-xlsx", help="작업내역: 으로 명시된 원본 XLSX. 지정 시 Google 작업내역 대체 금지")
     parser.add_argument("--schedule-json", required=True, help="작업일 요일을 선택한 근무 시트 근거 JSON")
     parser.add_argument("--run-context", required=True, help="현재 실행에서 Codex가 근거와 함께 작성한 JSON")
     parser.add_argument(
@@ -1106,14 +1107,31 @@ def source_scan_audit_errors(
     target_date: dt.date,
     expected_spreadsheet_id: str = "",
     expected_sheet_name: str = "",
+    expected_source_xlsx: Path | None = None,
 ) -> list[str]:
-    """Check that history came from a bounded formatted-value range scan."""
+    """Verify the explicitly selected source; never silently change input mode."""
     data = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(data, dict):
         return ["정기 작업내역 조회 감사정보가 없음"]
     audit = data.get("source_audit")
     if not isinstance(audit, dict):
         return ["정기 작업내역 조회 감사정보가 없음"]
+    if expected_source_xlsx is not None:
+        if audit.get("retrieval_method") != "local_xlsx":
+            return ["지정한 작업내역 XLSX 대신 다른 출처를 사용함"]
+        from prepare_source_history import prepare_xlsx_history
+
+        try:
+            expected = prepare_xlsx_history(expected_source_xlsx, target_date)
+        except Exception:
+            return ["지정한 작업내역 XLSX를 재검증할 수 없음. 원본과 저장 상태를 확인하세요."]
+        # Compare the entire filtered payload, not just its self-reported hash:
+        # removed/reordered/edited rows and changed originals must all fail.
+        if data != expected:
+            return ["정기 작업내역 JSON이 지정한 원본 XLSX의 해시·범위·필터 결과와 다름"]
+        return []
+    if audit.get("retrieval_method") == "local_xlsx":
+        return ["XLSX 작업내역에는 명시적인 --source-xlsx 원본 경로가 필요함"]
     errors: list[str] = []
     if int(audit.get("schema_version", 0) or 0) < 2:
         errors.append("정기 작업내역 조회 감사정보 버전이 오래됨")
@@ -1322,13 +1340,15 @@ def regular_candidates(
     require_scan_audit: bool = False,
     expected_spreadsheet_id: str = "",
     expected_sheet_name: str = "",
+    expected_source_xlsx: Path | None = None,
 ) -> tuple[list[Candidate], list[str]]:
-    if require_scan_audit:
+    if require_scan_audit or expected_source_xlsx is not None:
         audit_errors = source_scan_audit_errors(
             path,
             target_date,
             expected_spreadsheet_id,
             expected_sheet_name,
+            expected_source_xlsx,
         )
         if audit_errors:
             raise ValueError("; ".join(audit_errors))
@@ -3779,6 +3799,7 @@ def main() -> int:
     morning_dir = Path(args.morning_dir).resolve()
     afternoon_dir = Path(args.afternoon_dir).resolve()
     source_json = Path(args.source_json).resolve()
+    source_xlsx = Path(args.source_xlsx).resolve() if args.source_xlsx is not None else None
     schedule_json = Path(args.schedule_json).resolve()
     run_context_path = Path(args.run_context).resolve()
     required = [final_report, morning_dir, afternoon_dir, source_json, schedule_json, config_path, run_context_path]
@@ -3808,6 +3829,10 @@ def main() -> int:
     }
     japan_path = resolve_japan_input(final_report, args.japan_input)
     fingerprint_paths = [final_report, source_json, schedule_json, *work_paths]
+    if source_xlsx is not None:
+        if not source_xlsx.is_file():
+            raise ValueError("지정한 작업내역 XLSX가 없습니다. Google Sheets로 대체하지 않습니다.")
+        fingerprint_paths.append(source_xlsx)
     if japan_path:
         fingerprint_paths.extend(iter_document_files(japan_path))
         if japan_path.is_file() and japan_path.suffix.lower() == ".json":
@@ -3872,6 +3897,7 @@ def main() -> int:
         bool(config.get("inference", {}).get("require_source_scan_audit", False)),
         runtime_source_id,
         clean_text(source_sheet_config.get("source_sheet")),
+        source_xlsx,
     )
     warnings.extend(regular_warnings)
     current_source_history = source_history_has_operational_fields(regular)
@@ -4350,6 +4376,13 @@ def main() -> int:
         "role": "regular_history_json",
         "deduplicated": False,
     }
+    source_xlsx_info = {
+        "path": str(source_xlsx),
+        "size": source_xlsx.stat().st_size,
+        "sha256": sha256_file(source_xlsx),
+        "role": "regular_history_xlsx",
+        "deduplicated": False,
+    } if source_xlsx is not None else None
     schedule_info = {
         "path": str(schedule_json),
         "size": schedule_json.stat().st_size,
@@ -4392,7 +4425,8 @@ def main() -> int:
             "candidate_articles": len(japan),
         },
         "url_matching": url_audit,
-        "files": [final_info, source_info, schedule_info, *([japan_info] if japan_info else []), *worker_files],
+        "source_history": {"mode": "local_xlsx" if source_xlsx is not None else "google_sheets"},
+        "files": [final_info, source_info, *([source_xlsx_info] if source_xlsx_info else []), schedule_info, *([japan_info] if japan_info else []), *worker_files],
         "counts": {
             "final_articles": len(final_articles),
             "regular_candidates": len(regular),
